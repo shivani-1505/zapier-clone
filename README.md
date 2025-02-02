@@ -21,6 +21,7 @@ auditcue/
 ------------------------------------------------------------------------------------------------------------------------------------------------
 
 **The cmd Directory**
+
 This is like the control center of our application. Inside cmd/server/main.go, we have our main application entry point. This is where everything starts - it's responsible for:
 
 Initializing all components
@@ -36,6 +37,7 @@ Managing the application lifecycle
 ------------------------------------------------------------------------
 
 **The configs Directory**
+
 Think of this as the rulebook for our application. It contains different configuration files:
 
 app.yaml: Base configuration that applies everywhere
@@ -49,6 +51,7 @@ These files control things like database connections, API keys, and environment-
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 **The internal Directory**
+
 This is the heart of our application. The "internal" name is special in Go - it means these packages can only be used within our application, not by other projects. Let's break down each subdirectory:
 
 auth/
@@ -102,6 +105,7 @@ service.go: Contains the business logic for workflows
 ---------------------------------------------------------------------------------------------------
 
 **The pkg Directory**
+
 Unlike internal, this directory contains code that could be used by other projects. It includes:
 
 logger/: Handles application logging
@@ -113,6 +117,7 @@ errors/: Defines custom error types
 ------------------------------------------------------------------------
 
 **The docs Directory**
+
 This is our project's knowledge base:
 
 api/: API documentation (like Swagger files)
@@ -124,6 +129,7 @@ architecture/: Explains how the system is built
 ------------------------------------------------------------------------
 
 **The scripts Directory**
+
 Contains utility scripts that help with:
 
 Setting up development environments
@@ -135,6 +141,7 @@ Deployment processes
 ------------------------------------------------------------------------
 
 **The tests Directory**
+
 Organized into two main types:
 
 integration/: Tests how different parts work together
@@ -144,6 +151,7 @@ unit/: Tests individual components in isolation
 ------------------------------------------------------------------------
 
 **The web Directory**
+
 Contains frontend-related files:
 
 static/: CSS, JavaScript, and images
