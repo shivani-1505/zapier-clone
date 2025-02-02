@@ -15,10 +15,9 @@ auditcue/
 └── web/              # Frontend assets
 ```
 
-##Explanation of the Directory structure in detail
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-------------------------------------------------------------------------------------------------------------------------------------------------
-------------------------------------------------------------------------------------------------------------------------------------------------
+##Explanation of the Directory structure in detail
 
 **The cmd Directory**
 
@@ -62,7 +61,7 @@ middleware.go: Checks if users are allowed to access certain parts
 
 service.go: Contains the core logic for authentication
 
-
+------------------------------------------------------------------------
 connections/
 This manages how our application talks to other services (like Google or Slack):
 
@@ -72,7 +71,7 @@ handlers.go: Processes requests to connect/disconnect services
 
 service.go: Manages the connection lifecycle
 
-
+------------------------------------------------------------------------
 models/
 These are our data blueprints:
 
@@ -82,7 +81,7 @@ connection.go: Defines how we store connection information
 
 workflow.go: Defines how automated workflows are structured
 
-
+------------------------------------------------------------------------
 database/
 This handles all database operations:
 
@@ -90,7 +89,7 @@ migrations/: Contains files that set up and update our database structure
 
 database.go: Manages database connections and operations
 
-
+------------------------------------------------------------------------
 workflows/
 This is our automation engine:
 
@@ -172,7 +171,6 @@ Makefile: Contains commands for building and running the app
 
 README.md: Project overview and setup instructions
 
-------------------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------------------------------
 
 ## Getting Started
