@@ -2,8 +2,7 @@ package auth
 
 import (
 	"fmt"
-	"go-auth-main/database"
-	"go-auth-main/models"
+	"internal/models"
 	"strconv"
 	"time"
 
@@ -20,7 +19,6 @@ func GoogleLogin(c *fiber.Ctx) error {
 	if err := c.BodyParser(&data); err != nil {
 		return err
 	}
-
 	token := data["token"]
 	payload, err := idtoken.Validate(c.Context(), token, "976822190387-jiihgb0k3cm6k8lagfq9nbnl66ilrvip.apps.googleusercontent.com")
 	if err != nil {
@@ -31,7 +29,7 @@ func GoogleLogin(c *fiber.Ctx) error {
 
 	email := payload.Claims["email"].(string)
 	var user models.User
-	database.DB.Where("email = ?", email).First(&user)
+	models.DB.Where("email = ?", email).First(&user)
 	fmt.Println(user, email)
 	if user.Id == 0 {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
@@ -39,12 +37,10 @@ func GoogleLogin(c *fiber.Ctx) error {
 		})
 	}
 
-	// Generate JWT Token
 	claims := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.StandardClaims{
 		Issuer:    strconv.Itoa(int(user.Id)),
 		ExpiresAt: time.Now().Add(time.Hour * 24).Unix(),
 	})
-
 	tokenString, err := claims.SignedString([]byte(SecretKey))
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -72,7 +68,6 @@ func GoogleRegister(c *fiber.Ctx) error {
 	if err := c.BodyParser(&data); err != nil {
 		return err
 	}
-
 	token := data["token"]
 	if token == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -92,7 +87,7 @@ func GoogleRegister(c *fiber.Ctx) error {
 	name := payload.Claims["name"].(string)
 	fmt.Println("Google User Email:", email)
 	fmt.Println("Google User Name:", name)
-
+	
 	if email == "" || name == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"message": "Invalid token payload",
@@ -100,7 +95,7 @@ func GoogleRegister(c *fiber.Ctx) error {
 	}
 
 	var user models.User
-	database.DB.Where("email = ?", email).First(&user)
+	models.DB.Where("email = ?", email).First(&user)
 
 	if user.Id != 0 {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
@@ -108,19 +103,16 @@ func GoogleRegister(c *fiber.Ctx) error {
 		})
 	}
 
-	// Create new user without a password
 	user = models.User{
 		Name:  name,
 		Email: email,
 	}
-	database.DB.Create(&user)
+	models.DB.Create(&user)
 
-	// Generate JWT Token
 	claims := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.StandardClaims{
 		Issuer:    strconv.Itoa(int(user.Id)),
 		ExpiresAt: time.Now().Add(time.Hour * 24).Unix(),
 	})
-
 	tokenString, err := claims.SignedString([]byte(SecretKey))
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -145,15 +137,13 @@ func GoogleRegister(c *fiber.Ctx) error {
 
 func Register(c *fiber.Ctx) error {
 	var data map[string]string
-
 	if err := c.BodyParser(&data); err != nil {
 		return err
 	}
 
 	password, err := bcrypt.GenerateFromPassword([]byte(data["password"]), 14)
 	if err != nil {
-		c.Status(fiber.StatusInternalServerError)
-		return c.JSON(fiber.Map{"message": "error encrypting password"})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "error encrypting password"})
 	}
 
 	user := models.User{
@@ -161,40 +151,34 @@ func Register(c *fiber.Ctx) error {
 		Email:    data["email"],
 		Password: password,
 	}
-	database.DB.Create(&user)
+	models.DB.Create(&user)
 
 	return c.JSON(user)
 }
 
 func Login(c *fiber.Ctx) error {
 	var data map[string]string
-
 	if err := c.BodyParser(&data); err != nil {
 		return err
 	}
 
 	var user models.User
-
-	result := database.DB.Where("email = ?", data["email"]).First(&user)
+	result := models.DB.Where("email = ?", data["email"]).First(&user)
 	if result.Error != nil {
-		c.Status(fiber.StatusNotFound)
-		return c.JSON(fiber.Map{"message": "user not found"})
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"message": "user not found"})
 	}
 
 	if err := bcrypt.CompareHashAndPassword(user.Password, []byte(data["password"])); err != nil {
-		c.Status(fiber.StatusBadRequest)
-		return c.JSON(fiber.Map{"message": "incorrect password"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "incorrect password"})
 	}
 
 	claims := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.StandardClaims{
 		Issuer:    strconv.Itoa(int(user.Id)),
 		ExpiresAt: time.Now().Add(time.Hour * 24).Unix(),
 	})
-
 	token, err := claims.SignedString([]byte(SecretKey))
 	if err != nil {
-		c.Status(fiber.StatusInternalServerError)
-		return c.JSON(fiber.Map{"message": "could not login"})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "could not login"})
 	}
 
 	cookie := fiber.Cookie{
@@ -211,26 +195,22 @@ func Login(c *fiber.Ctx) error {
 		"name":    user.Name,
 	})
 }
-
 func User(c *fiber.Ctx) error {
 	cookie := c.Cookies("jwt")
-
 	token, err := jwt.ParseWithClaims(cookie, &jwt.StandardClaims{}, func(token *jwt.Token) (interface{}, error) {
 		return []byte(SecretKey), nil
 	})
 	if err != nil {
-		c.Status(fiber.StatusUnauthorized)
-		return c.JSON(fiber.Map{"message": "unauthenticated"})
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"message": "unauthenticated"})
 	}
 
 	claims, ok := token.Claims.(*jwt.StandardClaims)
 	if !ok || !token.Valid {
-		c.Status(fiber.StatusUnauthorized)
-		return c.JSON(fiber.Map{"message": "unauthenticated"})
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"message": "unauthenticated"})
 	}
 
 	var user models.User
-	database.DB.Where("id = ?", claims.Issuer).First(&user)
+	models.DB.Where("id = ?", claims.Issuer).First(&user)
 
 	return c.JSON(user)
 }
