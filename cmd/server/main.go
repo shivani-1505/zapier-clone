@@ -1,15 +1,15 @@
 package main
 
 import (
-	"go-auth-main/database"
-	"internal/api/routes"
+	"internal/auth"
+	"internal/models"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 )
 
 func main() {
-	database.Connect()
+	models.Connect()
 	app := fiber.New()
 
 	app.Use(cors.New(cors.Config{
