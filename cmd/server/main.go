@@ -2,7 +2,7 @@ package main
 
 import (
 	"go-auth-main/database"
-	"go-auth-main/routes"
+	"internal/api/routes"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
