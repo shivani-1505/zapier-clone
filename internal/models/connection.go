@@ -1,16 +1,15 @@
-package database
+package models
 
 import (
-	"go-auth-main/models"
-
-	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
 var DB *gorm.DB
 
 func Connect() {
-	connection, err := gorm.Open(mysql.Open("root:Abishek@15@/go-auth"), &gorm.Config{})
+	// PostgreSQL connection string format: "user=username password=password dbname=mydb sslmode=disable"
+	connection, err := gorm.Open(postgres.Open("host=localhost user=root password=Abishek@15 dbname=go-auth port=5432 sslmode=disable"), &gorm.Config{})
 
 	if err != nil {
 		panic("could not connect to the database")
