@@ -5,38 +5,60 @@ This project is a clone of Zapier built using GoLang for the backend and React f
 ## Project Structure
 
 ```
-zapier-clone
-├── backend
-│   ├── main.go
-│   ├── controllers
-│   │   └── userController.go
-│   ├── models
-│   │   └── user.go
-│   ├── routes
-│   │   └── userRoutes.go
-│   ├── database
-│   │   └── connection.go
-│   └── go.mod
-├── frontend
-│   ├── src
-│   │   ├── App.js
-│   │   ├── index.js
-│   │   ├── components
-│   │   │   └── UserComponent.js
-│   │   └── services
-│   │       └── userService.js
-│   ├── package.json
-│   └── public
-│       └── index.html
-└── README.md
+│-- backend
+    │-- api
+        │-- routes.go
+    │-- apps
+        │-- gdrive
+        │-- gmail
+        │-- jira
+        │-- outlook
+        │-- servicenow
+        │-- slack
+        │-- teams
+    │-- cmd
+        │-- server
+            │-- main.go
+    │-- internal
+        │-- auth
+        │-- config
+        │-- database
+        │-- http
+        │-- models
+        │-- store
+    │-- .dockerignore
+    │-- Dockerfile
+    │-- go.mod
+    │-- go.sum
+    │-- railway.toml
+│-- frontend
+    │-- public
+        │-- vite.svg
+    │-- src
+        │-- assets
+        │-- App.css
+        │-- App.tsx
+        │-- index.css
+        │-- main.jsx
+    │-- .gitignore
+    │-- eslint.config.js
+    │-- index.html
+    │-- package-lock.json
+    │-- package.json
+    │-- README.md
+    │-- vite.config.js
+│-- .DS_Store
+│-- Procfile
+│-- railway.json
+│-- README.md
+
 ```
 
 ## Backend Setup
 
 1. Navigate to the `backend` directory.
 2. Run `go mod tidy` to install dependencies.
-3. Set up your PostgreSQL database and update the connection settings in `backend/database/connection.go`.
-4. Start the server by running `go run main.go`.
+3. Start the server by running `go run main.go`.
 
 ## Frontend Setup
 
