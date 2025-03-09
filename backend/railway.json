@@ -1,9 +1,0 @@
-{
-    "build": {
-      "builder": "NIXPACKS"
-    },
-    "deploy": {
-      "startCommand": "cd backend && go run cmd/server/main.go",
-      "healthcheckPath": "/health"
-    }
-  }

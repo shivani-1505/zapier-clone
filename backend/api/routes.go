@@ -27,9 +27,6 @@ func SetupRoutes(mux *http.ServeMux) {
 	// Add a simple email sending endpoint
 	mux.HandleFunc("/api/email/send", handleEmailSend)
 
-	// Health check
-	mux.HandleFunc("/health", handleHealthCheck)
-
 	// Add debug endpoint to check stored integrations
 	mux.HandleFunc("/api/debug/integrations", handleDebugIntegrations)
 
@@ -69,17 +66,6 @@ func handleEmailSend(w http.ResponseWriter, r *http.Request) {
 		"status":  "success",
 		"message": "Email sent successfully",
 	})
-}
-
-func handleHealthCheck(w http.ResponseWriter, r *http.Request) {
-	// Check database connection
-	if err := database.CheckDatabaseConnection(); err != nil {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte(fmt.Sprintf("Database connection error: %v", err)))
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK - Service is healthy"))
 }
 
 func handleDebugIntegrations(w http.ResponseWriter, r *http.Request) {

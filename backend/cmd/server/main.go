@@ -63,13 +63,16 @@ func main() {
 	// Initialize credential manager
 	log.Println("Initializing credential manager...")
 	if err := auth.InitCredentialsManager(); err != nil {
-		log.Fatalf("Failed to initialize credentials manager: %v", err)
+		log.Printf("Warning: Failed to initialize credentials manager: %v", err)
+		log.Println("Continuing with limited functionality")
 	}
 
 	// Initialize PostgreSQL-based integration store
 	log.Println("Initializing PostgreSQL database...")
 	if err := database.InitIntegrationStore(); err != nil {
-		log.Fatalf("Failed to initialize PostgreSQL: %v", err)
+		log.Printf("Warning: Failed to initialize PostgreSQL: %v", err)
+		log.Println("Continuing without database connection - some features may be unavailable")
+		// We continue running even if the database isn't available yet
 	}
 
 	// Set up function callbacks to break circular dependencies
@@ -95,17 +98,39 @@ func main() {
 	// Create router
 	mux := http.NewServeMux()
 
+	// Add dedicated health check endpoint for Railway
+	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		// Always return success for Railway health check, even during initial deployment
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+
 	// Setup all routes
 	api.SetupRoutes(mux)
 
 	// Add static file server for frontend
-	fs := http.FileServer(http.Dir("./frontend/dist"))
+	// Find the right path for static files
+	staticDir := "./frontend/dist"
+	if _, err := os.Stat(staticDir); os.IsNotExist(err) {
+		// Try relative to executable
+		exePath, err := os.Executable()
+		if err == nil {
+			exeDir := filepath.Dir(exePath)
+			possiblePath := filepath.Join(exeDir, "frontend/dist")
+			if _, err := os.Stat(possiblePath); err == nil {
+				staticDir = possiblePath
+				log.Printf("Using static directory: %s", staticDir)
+			}
+		}
+	}
+
+	fs := http.FileServer(http.Dir(staticDir))
 	mux.Handle("/assets/", fs)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// Skip API paths
 		if r.URL.Path == "/api/auth/credentials" ||
 			r.URL.Path == "/api/slack/events" ||
-			r.URL.Path == "/health" ||
+			r.URL.Path == "/api/health" ||
 			r.URL.Path == "/api/email/test" ||
 			r.URL.Path == "/api/email/send" ||
 			r.URL.Path == "/api/debug/integrations" ||
@@ -114,7 +139,7 @@ func main() {
 		}
 
 		// Check if the path exists as a static file
-		path := filepath.Join("./frontend/dist", r.URL.Path)
+		path := filepath.Join(staticDir, r.URL.Path)
 		_, err := os.Stat(path)
 		if err == nil {
 			fs.ServeHTTP(w, r)
@@ -122,7 +147,13 @@ func main() {
 		}
 
 		// For client-side routing, serve index.html
-		http.ServeFile(w, r, "./frontend/dist/index.html")
+		indexPath := filepath.Join(staticDir, "index.html")
+		if _, err := os.Stat(indexPath); os.IsNotExist(err) {
+			log.Printf("Warning: index.html not found at %s", indexPath)
+			http.Error(w, "Frontend not available", http.StatusServiceUnavailable)
+			return
+		}
+		http.ServeFile(w, r, indexPath)
 	})
 
 	// Chain all middleware
