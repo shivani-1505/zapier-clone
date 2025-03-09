@@ -61,7 +61,7 @@ function SetupIntegration() {
       console.log("Submitting to API...");
       
       // Use the full URL to your Railway deployment
-      const apiUrl = 'https://auditcue-integration-production.up.railway.app/api/auth/credentials';
+      const apiUrl = 'https://integration-production-25ff.up.railway.app/api/auth/credentials';
       
       const response = await fetch(apiUrl, {
         method: 'POST',
@@ -191,7 +191,7 @@ function SuccessPage() {
         <ol>
           <li>Make sure your Slack Bot is invited to the channels you want to monitor</li>
           <li>Configure your Slack Event Subscriptions to point to your server URL at 
-            <code>https://auditcue-integration-production.up.railway.app/api/slack/events</code>
+            <code>https://integration-production-25ff.up.railway.app/api/slack/events</code>
           </li>
           <li>Subscribe to the 'message.channels' event in the Slack API dashboard</li>
         </ol>

@@ -1,0 +1,14 @@
+{
+    "version": 2,
+    "build": {
+      "builder": "NIXPACKS",
+      "buildCommand": "cd frontend && npm install && npm run dev"
+    },
+    "deploy": {
+      "startCommand": "cd backend/cmd/server && go run main.go",
+      "healthcheckPath": "/api/health",
+      "healthcheckTimeout": 60,
+      "restartPolicyType": "ON_FAILURE",
+      "restartPolicyMaxRetries": 10
+    }
+  }
