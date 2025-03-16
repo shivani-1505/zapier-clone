@@ -1,0 +1,47 @@
+# Build stage
+FROM golang:1.18-alpine AS build
+
+# Install build dependencies
+RUN apk add --no-cache gcc musl-dev postgresql-dev
+
+# Set working directory
+WORKDIR /build
+
+# Copy go mod and sum files
+COPY backend/go.mod backend/go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY backend/ ./
+
+# Build the application
+RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o auditcue ./cmd/server
+
+# Final stage
+FROM alpine:3.16
+
+# Install runtime dependencies
+RUN apk add --no-cache ca-certificates tzdata sqlite
+
+# Set working directory
+WORKDIR /app
+
+# Copy the binary from the build stage
+COPY --from=build /build/auditcue .
+
+# Create directories for data and config
+RUN mkdir -p /app/data /app/config
+
+# Copy default config
+COPY config/config.yaml /app/config/
+
+# Set environment variables
+ENV AUDITCUE_ENVIRONMENT=production
+
+# Expose port
+EXPOSE 8080
+
+# Run the application
+CMD ["./auditcue"]
