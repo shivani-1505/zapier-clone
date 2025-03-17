@@ -107,7 +107,8 @@ The framework is built using a modern stack:
 
 5. Access the application:
    - Frontend: http://localhost:3000
-   - Backend API: http://localhost:8080
+   - Backend API: http://localhost:8081
+     
 
 ### Running with Docker
 
