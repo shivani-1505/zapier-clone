@@ -1,90 +1,82 @@
+// backend/cmd/server/main.go
 package main
 
 import (
 	"context"
-	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"github.com/auditcue/integration-framework/internal/api"
-	"github.com/auditcue/integration-framework/internal/config"
-	"github.com/auditcue/integration-framework/internal/db"
-	"github.com/auditcue/integration-framework/internal/queue"
-	"github.com/auditcue/integration-framework/pkg/logger"
+	"github.com/gorilla/mux"
+	routes "github.com/shivani-1505/zapier-clone/backend/internal/api" // Import with alias matching the package name
+	"github.com/shivani-1505/zapier-clone/backend/internal/integrations/servicenow"
+	"github.com/shivani-1505/zapier-clone/backend/internal/integrations/slack"
+	"github.com/shivani-1505/zapier-clone/backend/internal/reporting"
 )
 
 func main() {
-	// Initialize logger
-	logger := logger.NewLogger()
-	logger.Info("Starting AuditCue Integration Framework")
+	// Initialize router
+	r := mux.NewRouter()
 
-	// Load configuration
-	cfg, err := config.Load()
-	if err != nil {
-		logger.Fatal("Failed to load configuration", "error", err)
-	}
+	// Initialize clients
+	serviceNowClient := servicenow.NewClient(
+		getEnv("SERVICENOW_URL", "https://example.service-now.com"),
+		getEnv("SERVICENOW_USERNAME", "admin"),
+		getEnv("SERVICENOW_PASSWORD", "password"),
+	)
 
-	// Initialize database
-	database, err := db.NewDatabase(cfg.Database)
-	if err != nil {
-		logger.Fatal("Failed to initialize database", "error", err)
-	}
-	defer database.Close()
+	slackClient := slack.NewClient(
+		getEnv("SLACK_API_TOKEN", "xoxb-your-token-here"),
+	)
 
-	// Run migrations
-	if err := database.Migrate(); err != nil {
-		logger.Fatal("Failed to run database migrations", "error", err)
-	}
+	// Setup API routes - use the package name you've set in routes.go
+	routes.SetupRoutes(r, serviceNowClient, slackClient)
 
-	// Initialize job queue
-	jobQueue, err := queue.NewQueue(cfg.Queue)
-	if err != nil {
-		logger.Fatal("Failed to initialize job queue", "error", err)
-	}
-	defer jobQueue.Close()
+	// Initialize and start the report scheduler
+	reportScheduler := reporting.NewReportScheduler(serviceNowClient, slackClient)
+	reportScheduler.Start()
+	defer reportScheduler.Stop()
 
-	// Start workers
-	workers := queue.StartWorkers(jobQueue, cfg.Workers.Count, database, logger)
-	defer workers.Stop()
-
-	// Create router and initialize API
-	router := api.SetupRouter(cfg, database, jobQueue, logger)
-
-	// Configure server
+	// Create server
 	srv := &http.Server{
-		Addr:         fmt.Sprintf(":%d", cfg.Server.Port),
-		Handler:      router,
-		ReadTimeout:  time.Duration(cfg.Server.ReadTimeoutSeconds) * time.Second,
-		WriteTimeout: time.Duration(cfg.Server.WriteTimeoutSeconds) * time.Second,
-		IdleTimeout:  time.Duration(cfg.Server.IdleTimeoutSeconds) * time.Second,
+		Addr:         getEnv("SERVER_ADDR", ":8081"),
+		Handler:      r,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	// Start server in a goroutine
 	go func() {
-		logger.Info("Starting HTTP server", "port", cfg.Server.Port)
+		log.Printf("Starting server on %s", srv.Addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatal("HTTP server error", "error", err)
+			log.Fatalf("Server error: %v", err)
 		}
 	}()
 
-	// Wait for interrupt signal to gracefully shut down the server
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
+	// Wait for interrupt signal
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	<-c
 
-	logger.Info("Shutting down server...")
-
-	// Create a deadline to wait for
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Server.ShutdownTimeoutSeconds)*time.Second)
+	// Gracefully shutdown
+	log.Println("Shutting down server...")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-
-	// Doesn't block if no connections, but will wait until the timeout deadline
 	if err := srv.Shutdown(ctx); err != nil {
-		logger.Error("Server forced to shutdown", "error", err)
+		log.Fatalf("Server forced to shutdown: %v", err)
 	}
 
-	logger.Info("Server exiting")
+	log.Println("Server gracefully stopped")
+}
+
+// Helper function to get environment variables with default fallback
+func getEnv(key, fallback string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return fallback
 }
