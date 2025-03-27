@@ -1,0 +1,85 @@
+version: '3.8'
+
+services:
+  # Backend API service
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    container_name: auditcue-backend
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../config:/app/config
+    environment:
+      - AUDITCUE_ENVIRONMENT=development
+      - AUDITCUE_SERVER_PORT=8080
+      - AUDITCUE_DATABASE_DRIVER=postgres
+      - AUDITCUE_DATABASE_HOST=postgres
+      - AUDITCUE_DATABASE_PORT=5432
+      - AUDITCUE_DATABASE_NAME=auditcue
+      - AUDITCUE_DATABASE_USER=auditcue
+      - AUDITCUE_DATABASE_PASSWORD=auditcue
+      - AUDITCUE_DATABASE_SSL_MODE=disable
+      - AUDITCUE_QUEUE_DRIVER=redis
+      - AUDITCUE_QUEUE_ADDRESS=redis:6379
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+    networks:
+      - auditcue-network
+
+  # Frontend web application
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.frontend
+    container_name: auditcue-frontend
+    ports:
+      - "3000:80"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8080
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - auditcue-network
+
+  # Redis for job queue and caching
+  redis:
+    image: redis:7-alpine
+    container_name: auditcue-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    networks:
+      - auditcue-network
+
+  # Optional: PostgreSQL database (alternative to SQLite)
+  # Uncomment and update configuration to use
+  # postgres:
+  #   image: postgres:14-alpine
+  #   container_name: auditcue-postgres
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - postgres-data:/var/lib/postgresql/data
+  #   environment:
+  #     - POSTGRES_USER=auditcue
+  #     - POSTGRES_PASSWORD=auditcue
+  #     - POSTGRES_DB=auditcue
+  #   restart: unless-stopped
+  #   networks:
+  #     - auditcue-network
+
+volumes:
+  redis-data:
+  # postgres-data:
+
+networks:
+  auditcue-network:
+    driver: bridge

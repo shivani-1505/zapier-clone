@@ -1,0 +1,104 @@
+# AuditCue Integration Framework Configuration
+
+# Environment: development, production, test
+environment: "development"
+
+# Server configuration
+server:
+  port: 8080
+  read_timeout_seconds: 30
+  write_timeout_seconds: 30
+  idle_timeout_seconds: 60
+  shutdown_timeout_seconds: 15
+  enable_cors: true
+
+# Database configuration
+database:
+  driver: "postgres" # sqlite, postgres
+  host: "localhost"
+  port: 5432
+  name: "auditcue"
+  user: "auditcue"
+  password: "auditcue"
+  ssl_mode: "disable"
+  # For SQLite (not used)
+  # file_path: "./data/auditcue.db"
+
+# Queue configuration
+queue:
+  driver: "redis" # redis, memory
+  address: "localhost:6379"
+  password: ""
+  db: 0
+
+# Authentication configuration
+auth:
+  jwt_secret: "change-me-in-production"
+  jwt_expiration_minutes: 60
+  encryption_key: "change-me-in-production-32-bytes-key"
+
+# Worker configuration
+workers:
+  count: 5
+  max_retries: 3
+  retry_delay_seconds: 60
+  job_timeout_seconds: 300
+  poll_timeout_seconds: 5
+
+# Integration services configuration
+integrations:
+  # Jira integration
+  jira:
+    client_id: ""
+    client_secret: ""
+    auth_url: "https://auth.atlassian.com/oauth/authorize"
+    token_url: "https://auth.atlassian.com/oauth/token"
+    redirect_url: "http://localhost:8080/api/v1/auth/oauth/callback/jira"
+    api_url: "https://api.atlassian.com"
+
+  # Slack integration
+  slack:
+    client_id: ""
+    client_secret: ""
+    auth_url: "https://slack.com/oauth/v2/authorize"
+    token_url: "https://slack.com/api/oauth.v2.access"
+    redirect_url: "http://localhost:8080/api/v1/auth/oauth/callback/slack"
+    api_url: "https://slack.com/api"
+
+  # Microsoft Teams integration
+  teams:
+    client_id: ""
+    client_secret: ""
+    auth_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+    token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+    redirect_url: "http://localhost:8080/api/v1/auth/oauth/callback/teams"
+    api_url: "https://graph.microsoft.com/v1.0"
+
+  # Google Workspace integration
+  google:
+    client_id: ""
+    client_secret: ""
+    auth_url: "https://accounts.google.com/o/oauth2/auth"
+    token_url: "https://oauth2.googleapis.com/token"
+    redirect_url: "http://localhost:8080/api/v1/auth/oauth/callback/google"
+    api_url: "https://www.googleapis.com"
+    scopes: "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/drive"
+
+  # Microsoft 365 integration
+  microsoft:
+    client_id: ""
+    client_secret: ""
+    auth_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+    token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+    redirect_url: "http://localhost:8080/api/v1/auth/oauth/callback/microsoft"
+    api_url: "https://graph.microsoft.com/v1.0"
+    scopes: "User.Read Mail.Read Files.Read"
+
+  # ServiceNow integration
+  servicenow:
+    client_id: ""
+    client_secret: ""
+    auth_url: "https://{instance}.service-now.com/oauth_auth.do"
+    token_url: "https://{instance}.service-now.com/oauth_token.do"
+    redirect_url: "http://localhost:8080/api/v1/auth/oauth/callback/servicenow"
+    api_url: "https://{instance}.service-now.com/api"
