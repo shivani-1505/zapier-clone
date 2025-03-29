@@ -3,8 +3,10 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/shivani-1505/zapier-clone/backend/internal/integrations/jira"
 	"github.com/shivani-1505/zapier-clone/backend/internal/integrations/servicenow"
@@ -216,13 +218,86 @@ func (h *ServiceNowWebhookHandler) processControlTestWebhook(payload servicenow.
 	switch payload.ActionType {
 	case "inserted":
 		// New control test created
-		_, err := h.ControlTestHandler.HandleNewControlTest(test)
+		messageTS, err := h.ControlTestHandler.HandleNewControlTest(test)
 		if err != nil {
 			log.Printf("Error handling new control test: %v", err)
+			return
+		}
+
+		// Enhanced functionality: Create Jira issue for control test
+		jiraTicket := &jira.Ticket{
+			Project:     h.JiraClient.ProjectKey,
+			IssueType:   "Task",
+			Summary:     fmt.Sprintf("Test Control: %s", test.Control),
+			Description: test.Description,
+			DueDate:     test.DueDate,
+			Fields: map[string]interface{}{
+				"customfield_servicenow_id": test.ID,
+			},
+		}
+
+		// If the test has an assignee, add it to the ticket
+		if test.AssignedTo != "" {
+			jiraTicket.Fields["assignee"] = map[string]string{"name": test.AssignedTo}
+		}
+
+		createdTicket, err := h.JiraClient.CreateIssue(jiraTicket)
+		if err != nil {
+			log.Printf("Error creating Jira issue for control test %s: %v", test.ID, err)
+			return
+		}
+
+		log.Printf("Created Jira issue %s for control test: %s", createdTicket.Key, test.ID)
+
+		// Add Jira ticket info to the Slack thread if we have a message timestamp
+		if messageTS != "" {
+			jiraLink := fmt.Sprintf("%s/browse/%s", h.JiraClient.BaseURL, createdTicket.Key)
+			message := slack.Message{
+				Text: fmt.Sprintf("📋 Jira ticket created: <%s|%s>", jiraLink, createdTicket.Key),
+			}
+
+			channelID := slack.ChannelMapping["control-testing"]
+			if _, err := h.SlackClient.PostReply(channelID, messageTS, message); err != nil {
+				log.Printf("Error posting Jira ticket info to Slack: %v", err)
+			}
 		}
 	case "updated":
 		// Control test updated
 		log.Printf("Control test updated: %s", test.ID)
+
+		// Find corresponding Jira ticket and update it
+		jql := fmt.Sprintf("project=%s AND customfield_servicenow_id=\"%s\"", h.JiraClient.ProjectKey, test.ID)
+		searchResult, err := h.JiraClient.SearchIssues(jql)
+		if err != nil {
+			log.Printf("Error searching for Jira ticket for control test %s: %v", test.ID, err)
+			return
+		}
+
+		if len(searchResult.Issues) > 0 {
+			issueKey := searchResult.Issues[0].Key
+
+			// Create update object
+			update := &jira.TicketUpdate{
+				Description: test.Description,
+			}
+
+			// If test has a status, map it to Jira status
+			if test.Status != "" {
+				update.Status = mapControlTestStatusToJiraStatus(test.Status)
+			}
+
+			// If test has results, add them to the description
+			if test.Results != "" {
+				update.Description = fmt.Sprintf("%s\n\nTest Results:\n%s", test.Description, test.Results)
+			}
+
+			// Update the Jira ticket
+			if err := h.JiraClient.UpdateIssue(issueKey, update); err != nil {
+				log.Printf("Error updating Jira ticket %s for control test %s: %v", issueKey, test.ID, err)
+			} else {
+				log.Printf("Updated Jira ticket %s for control test %s", issueKey, test.ID)
+			}
+		}
 	case "deleted":
 		// Control test deleted
 		log.Printf("Control test deleted: %s", test.ID)
@@ -284,6 +359,28 @@ func (h *ServiceNowWebhookHandler) processVendorRiskWebhook(payload servicenow.W
 		if err != nil {
 			log.Printf("Error handling new vendor risk: %v", err)
 		}
+
+		// Enhanced functionality for vendor risk to better integrate with Jira
+		if err == nil {
+			// Create Jira issue for vendor risk
+			jiraTicket := &jira.Ticket{
+				Project:     h.JiraClient.ProjectKey,
+				IssueType:   "Task",
+				Summary:     fmt.Sprintf("Vendor Risk: %s", risk.VendorName),
+				Description: fmt.Sprintf("Request updated report for vendor risk:\n\n%s", risk.Description),
+				Priority:    mapSeverityToPriority(risk.Severity),
+				Fields: map[string]interface{}{
+					"customfield_servicenow_id": risk.ID,
+				},
+			}
+
+			createdTicket, err := h.JiraClient.CreateIssue(jiraTicket)
+			if err != nil {
+				log.Printf("Error creating Jira issue for vendor risk %s: %v", risk.ID, err)
+			} else {
+				log.Printf("Created Jira issue %s for vendor risk: %s", createdTicket.Key, risk.ID)
+			}
+		}
 	case "updated":
 		// Vendor risk updated
 		log.Printf("Vendor risk updated: %s", risk.ID)
@@ -312,9 +409,77 @@ func (h *ServiceNowWebhookHandler) processRegulatoryChangeWebhook(payload servic
 	switch payload.ActionType {
 	case "inserted":
 		// New regulatory change created
-		_, err := h.RegulatoryChangeHandler.HandleNewRegulatoryChange(change)
+		messageTS, err := h.RegulatoryChangeHandler.HandleNewRegulatoryChange(change)
 		if err != nil {
 			log.Printf("Error handling new regulatory change: %v", err)
+			return
+		}
+
+		// Enhanced functionality: Create Jira Epic with subtasks for regulatory change
+		epicTicket := &jira.Ticket{
+			Project:     h.JiraClient.ProjectKey,
+			IssueType:   "Epic",
+			Summary:     fmt.Sprintf("Regulatory Change: %s", change.ShortDesc),
+			Description: change.Description,
+			Epic: &jira.EpicDetails{
+				Name: fmt.Sprintf("Regulatory Change: %s", change.ShortDesc),
+			},
+			DueDate: change.EffectiveDate,
+			Fields: map[string]interface{}{
+				"customfield_servicenow_id": change.ID,
+			},
+		}
+
+		createdEpic, err := h.JiraClient.CreateIssue(epicTicket)
+		if err != nil {
+			log.Printf("Error creating Jira epic for regulatory change %s: %v", change.ID, err)
+			return
+		}
+
+		// Create standard subtasks for regulatory implementation
+		tasks := []struct {
+			summary     string
+			description string
+		}{
+			{
+				summary:     "Update privacy policy",
+				description: fmt.Sprintf("Update privacy policy due to %s", change.ShortDesc),
+			},
+			{
+				summary:     "Train staff",
+				description: fmt.Sprintf("Train staff on %s requirements", change.ShortDesc),
+			},
+		}
+
+		for _, task := range tasks {
+			subtask := &jira.Ticket{
+				Project:     h.JiraClient.ProjectKey,
+				IssueType:   "Task",
+				Summary:     task.summary,
+				Description: task.description,
+				Parent:      createdEpic.Key,
+				DueDate:     change.EffectiveDate,
+				Fields: map[string]interface{}{
+					"customfield_servicenow_id": change.ID,
+				},
+			}
+
+			if _, err := h.JiraClient.CreateIssue(subtask); err != nil {
+				log.Printf("Error creating subtask '%s' for regulatory change %s: %v", task.summary, change.ID, err)
+			}
+		}
+
+		// Add Jira epic info to the Slack thread
+		if messageTS != "" {
+			jiraLink := fmt.Sprintf("%s/browse/%s", h.JiraClient.BaseURL, createdEpic.Key)
+			message := slack.Message{
+				Text: fmt.Sprintf("📎 Jira epic created: <%s|%s> - Implementation tasks have been created.", jiraLink, createdEpic.Key),
+			}
+
+			channelID := slack.ChannelMapping["regulatory"]
+			if _, err := h.SlackClient.PostReply(channelID, messageTS, message); err != nil {
+				log.Printf("Error posting Jira epic info to Slack: %v", err)
+			}
 		}
 	case "updated":
 		// Regulatory change updated
@@ -322,5 +487,37 @@ func (h *ServiceNowWebhookHandler) processRegulatoryChangeWebhook(payload servic
 	case "deleted":
 		// Regulatory change deleted
 		log.Printf("Regulatory change deleted: %s", change.ID)
+	}
+}
+
+// Helper function to map severity to priority
+func mapSeverityToPriority(severity string) string {
+	switch strings.ToLower(severity) {
+	case "critical":
+		return "Highest"
+	case "high":
+		return "High"
+	case "medium":
+		return "Medium"
+	case "low":
+		return "Low"
+	default:
+		return "Medium"
+	}
+}
+
+// mapControlTestStatusToJiraStatus maps ServiceNow control test status to Jira status
+func mapControlTestStatusToJiraStatus(status string) string {
+	switch strings.ToLower(status) {
+	case "pass", "passed":
+		return "Done"
+	case "fail", "failed":
+		return "Done" // Even failed tests are considered "Done" from a workflow perspective
+	case "in progress":
+		return "In Progress"
+	case "open":
+		return "To Do"
+	default:
+		return status // Use the status as-is if no mapping found
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/shivani-1505/zapier-clone/backend/internal/integrations/jira"
 	"github.com/shivani-1505/zapier-clone/backend/internal/integrations/servicenow"
 	"github.com/shivani-1505/zapier-clone/backend/internal/integrations/slack"
 )
@@ -12,6 +13,7 @@ import (
 // ReportScheduler schedules and runs periodic reports
 type ReportScheduler struct {
 	ReportingHandler *servicenow.ReportingHandler
+	JiraClient       *jira.Client
 	running          bool
 	stopChan         chan struct{}
 }
@@ -101,6 +103,18 @@ func (s *ReportScheduler) RunManualReport(reportType string) error {
 		return s.ReportingHandler.SendWeeklySummary()
 	case "risk-category":
 		return s.ReportingHandler.SendRiskCategorySummary()
+	case "dashboard":
+		// Get dashboard data manually
+		data, err := GetDashboardData(s.JiraClient)
+		if err != nil {
+			return err
+		}
+
+		// Log the dashboard data
+		log.Printf("Dashboard: OpenRisks=%d, CompletedControls=%d, OpenRegulatoryTasks=%d, OverdueItems=%d, ComplianceScore=%d%%",
+			data.OpenRisks, data.CompletedControls, data.OpenRegulatoryTasks, data.OverdueItems, data.ComplianceScore)
+
+		return nil
 	default:
 		return nil
 	}

@@ -1,3 +1,5 @@
+// backend/internal/integrations/jira/models.go
+
 package jira
 
 import (

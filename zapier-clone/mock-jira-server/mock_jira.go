@@ -531,7 +531,7 @@ func triggerWebhook(w http.ResponseWriter, r *http.Request) {
 
 	webhookURL := r.URL.Query().Get("webhook_url")
 	if webhookURL == "" {
-		webhookURL = "http://localhost:8080/api/webhooks/jira"
+		webhookURL = "http://localhost:8081/api/webhooks/jira"
 	}
 
 	jsonPayload, _ := json.Marshal(webhookPayload)
@@ -589,7 +589,7 @@ func triggerStatusChangeWebhook(issueKey string, newStatus string, previousStatu
 		},
 	}
 
-	webhookURL := "http://localhost:8080/api/webhooks/jira"
+	webhookURL := "http://localhost:8081/api/webhooks/jira"
 	jsonPayload, _ := json.Marshal(payload)
 	resp, err := http.Post(webhookURL, "application/json", strings.NewReader(string(jsonPayload)))
 	if err != nil {
@@ -725,7 +725,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                             <label>ServiceNow ID: <input type="text" name="servicenow_id" value=""></label>
                         </p>
                         <p>
-                            <label>Webhook URL: <input type="text" name="webhook_url" value="http://localhost:8080/api/webhooks/jira"></label>
+                            <label>Webhook URL: <input type="text" name="webhook_url" value="http://localhost:8081/api/webhooks/jira"></label>
                         </p>
                         <p><button type="submit" class="btn">Send Webhook</button></p>
                     </form>
@@ -747,7 +747,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                             </label>
                         </p>
                         <p>
-                            <label>Webhook URL: <input type="text" name="webhook_url" value="http://localhost:8080/api/webhooks/jira"></label>
+                            <label>Webhook URL: <input type="text" name="webhook_url" value="http://localhost:8081/api/webhooks/jira"></label>
                         </p>
                         <p><button type="submit" class="btn">Send Webhook</button></p>
                     </form>
@@ -763,7 +763,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                             <label>Comment: <input type="text" name="comment" value="This is a test comment"></label>
                         </p>
                         <p>
-                            <label>Webhook URL: <input type="text" name="webhook_url" value="http://localhost:8080/api/webhooks/jira"></label>
+                            <label>Webhook URL: <input type="text" name="webhook_url" value="http://localhost:8081/api/webhooks/jira"></label>
                         </p>
                         <p><button type="submit" class="btn">Send Webhook</button></p>
                     </form>
