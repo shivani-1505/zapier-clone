@@ -78,12 +78,16 @@ func main() {
 	r.HandleFunc("/rest/api/2/issue/{key}/comment", handleComments).Methods("GET", "POST")
 	r.HandleFunc("/rest/api/2/issue/{key}/transitions", handleTransitions).Methods("GET", "POST")
 	r.HandleFunc("/rest/api/2/project", handleProjects).Methods("GET")
+	r.HandleFunc("/rest/api/2/search", handleSearchIssues).Methods("GET")
 
-	// Webhook receiver (this would be an endpoint in your application)
+	// Webhook receiver
 	r.HandleFunc("/api/webhooks/jira", handleReceiveWebhook).Methods("POST")
 
-	// Webhook trigger (special endpoint to simulate sending webhooks to your app)
+	// Webhook trigger
 	r.HandleFunc("/trigger_webhook/{event_type}", triggerWebhook).Methods("POST")
+
+	// Reset endpoint
+	r.HandleFunc("/reset", handleReset).Methods("POST")
 
 	// Health check and UI
 	r.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -94,19 +98,16 @@ func main() {
 	r.HandleFunc("/", handleUI).Methods("GET")
 
 	// Start server
-	port := "3001" // Different from ServiceNow mock
+	port := "3001"
 	fmt.Printf("Starting mock Jira server on port %s...\n", port)
 	log.Fatal(http.ListenAndServe(":"+port, r))
 }
-
-// Jira API handler implementations
 
 func handleIssues(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	switch r.Method {
 	case "GET":
-		// Return all issues
 		tickets := MockDatabase["tickets"].(map[string]JiraTicket)
 		var results []JiraTicket
 		for _, ticket := range tickets {
@@ -115,7 +116,6 @@ func handleIssues(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(results)
 
 	case "POST":
-		// Create a new issue
 		var requestData map[string]interface{}
 		if err := json.NewDecoder(r.Body).Decode(&requestData); err != nil {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -128,22 +128,52 @@ func handleIssues(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Generate ID and key
-		id := fmt.Sprintf("10%d", len(MockDatabase["tickets"].(map[string]JiraTicket))+1)
-		key := fmt.Sprintf("AUDIT-%d", len(MockDatabase["tickets"].(map[string]JiraTicket))+1)
+		tickets := MockDatabase["tickets"].(map[string]JiraTicket)
+		id := fmt.Sprintf("10%d", len(tickets)+1)
+		keyNum := len(tickets) + 1
+		var key string
+		for {
+			key = fmt.Sprintf("AUDIT-%d", keyNum)
+			if _, exists := tickets[key]; !exists {
+				break
+			}
+			keyNum++
+		}
 
-		// Extract data from fields
 		summary := ""
 		if sum, ok := fields["summary"].(string); ok {
 			summary = sum
 		}
-
 		description := ""
 		if desc, ok := fields["description"].(string); ok {
 			description = desc
 		}
+		dueDate := ""
+		if dd, ok := fields["duedate"].(string); ok {
+			dueDate = dd
+		}
+		assignee := ""
+		if a, ok := fields["assignee"].(map[string]interface{}); ok {
+			if name, ok := a["name"].(string); ok {
+				assignee = name
+			}
+		}
 
-		// Create the ticket
+		// Initialize Fields map if nil
+		if fields == nil {
+			fields = make(map[string]interface{})
+		}
+
+		// Extract customfield_servicenow_id explicitly
+		var serviceNowID string
+		if snID, ok := fields["customfield_servicenow_id"].(string); ok && snID != "" {
+			serviceNowID = snID
+		} else if snID, ok := requestData["customfield_servicenow_id"].(string); ok && snID != "" {
+			// Fallback to root level if not in fields
+			serviceNowID = snID
+			fields["customfield_servicenow_id"] = snID
+		}
+
 		ticket := JiraTicket{
 			ID:          id,
 			Key:         key,
@@ -153,22 +183,20 @@ func handleIssues(w http.ResponseWriter, r *http.Request) {
 			Status:      "To Do",
 			Created:     time.Now().Format(time.RFC3339),
 			Updated:     time.Now().Format(time.RFC3339),
+			DueDate:     dueDate,
+			Assignee:    assignee,
+			Fields:      fields,
 			Comments:    []JiraComment{},
 		}
 
-		// Check for custom fields for ServiceNow mapping
-		if customFields, ok := fields["customfield_servicenow_id"]; ok {
-			if snID, ok := customFields.(string); ok && snID != "" {
-				ServiceNowJiraMapping[snID] = key
-			}
+		if serviceNowID != "" {
+			ServiceNowJiraMapping[serviceNowID] = key
 		}
 
-		// Save to database
-		tickets := MockDatabase["tickets"].(map[string]JiraTicket)
 		tickets[key] = ticket
 		MockDatabase["tickets"] = tickets
+		log.Printf("Created Jira issue: %s with customfield_servicenow_id: %v", key, ticket.Fields["customfield_servicenow_id"])
 
-		// Return success with key
 		json.NewEncoder(w).Encode(map[string]string{
 			"id":   id,
 			"key":  key,
@@ -218,13 +246,27 @@ func handleIssueByKey(w http.ResponseWriter, r *http.Request) {
 					ticket.Assignee = name
 				}
 			}
+			if dueDate, ok := fields["duedate"].(string); ok {
+				ticket.DueDate = dueDate
+			}
+			if status, ok := fields["status"].(map[string]interface{}); ok {
+				if name, ok := status["name"].(string); ok {
+					ticket.Status = name
+				}
+			}
+			for k, v := range fields {
+				ticket.Fields[k] = v
+			}
 		}
 
+		previousStatus := ticket.Status // Store previous status for changelog
 		ticket.Updated = time.Now().Format(time.RFC3339)
 		tickets[key] = ticket
 		MockDatabase["tickets"] = tickets
+		log.Printf("Updated Jira issue: %s to status: %s", key, ticket.Status)
 
 		w.WriteHeader(http.StatusNoContent)
+		go triggerStatusChangeWebhook(key, ticket.Status, previousStatus)
 
 	case "DELETE":
 		delete(tickets, key)
@@ -247,7 +289,6 @@ func handleComments(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case "GET":
-		// Return comments
 		response := map[string]interface{}{
 			"comments": ticket.Comments,
 			"total":    len(ticket.Comments),
@@ -255,7 +296,6 @@ func handleComments(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(response)
 
 	case "POST":
-		// Add comment
 		var commentData map[string]interface{}
 		if err := json.NewDecoder(r.Body).Decode(&commentData); err != nil {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -297,9 +337,7 @@ func handleTransitions(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case "GET":
-		// Return available transitions
 		transitions := []JiraTransition{}
-
 		switch ticket.Status {
 		case "To Do":
 			transitions = append(transitions, JiraTransition{
@@ -331,7 +369,6 @@ func handleTransitions(w http.ResponseWriter, r *http.Request) {
 		})
 
 	case "POST":
-		// Process transition
 		var transitionRequest map[string]interface{}
 		if err := json.NewDecoder(r.Body).Decode(&transitionRequest); err != nil {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -350,13 +387,12 @@ func handleTransitions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Process transition
+		previousStatus := ticket.Status // Store previous status for changelog
 		switch transitionID {
 		case "21": // To Do -> In Progress
 			ticket.Status = "In Progress"
 		case "31": // In Progress -> Done
 			ticket.Status = "Done"
-			// Check for resolution
 			fieldsData, ok := transitionRequest["fields"].(map[string]interface{})
 			if ok {
 				resolutionData, ok := fieldsData["resolution"].(map[string]interface{})
@@ -381,9 +417,7 @@ func handleTransitions(w http.ResponseWriter, r *http.Request) {
 		MockDatabase["tickets"] = tickets
 
 		w.WriteHeader(http.StatusNoContent)
-
-		// Send webhook notification about the status change
-		go triggerStatusChangeWebhook(key, ticket.Status)
+		go triggerStatusChangeWebhook(key, ticket.Status, previousStatus)
 	}
 }
 
@@ -399,18 +433,68 @@ func handleProjects(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(projectList)
 }
 
+func handleSearchIssues(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	jql := r.URL.Query().Get("jql")
+	if jql == "" {
+		http.Error(w, "Missing JQL parameter", http.StatusBadRequest)
+		return
+	}
+
+	tickets := MockDatabase["tickets"].(map[string]JiraTicket)
+	var results []JiraTicket
+
+	// Parse JQL (e.g., "project=AUDIT AND customfield_servicenow_id=ctrl003")
+	jqlParts := strings.Split(jql, " AND ")
+	projectFilter := ""
+	customFieldFilter := ""
+	for _, part := range jqlParts {
+		if strings.HasPrefix(part, "project=") {
+			projectFilter = strings.TrimPrefix(part, "project=")
+		}
+		if strings.HasPrefix(part, "customfield_servicenow_id=") {
+			customFieldFilter = strings.TrimPrefix(part, "customfield_servicenow_id=")
+		}
+	}
+
+	for _, ticket := range tickets {
+		matchesProject := projectFilter == "" || strings.HasPrefix(ticket.Key, projectFilter)
+		matchesCustomField := customFieldFilter == "" || (ticket.Fields["customfield_servicenow_id"] != nil && ticket.Fields["customfield_servicenow_id"].(string) == customFieldFilter)
+		if matchesProject && matchesCustomField {
+			if ticket.Fields == nil {
+				ticket.Fields = make(map[string]interface{})
+			}
+			ticket.Fields["duedate"] = ticket.DueDate
+			ticket.Fields["assignee"] = map[string]interface{}{
+				"name": ticket.Assignee,
+			}
+			ticket.Fields["status"] = map[string]interface{}{
+				"name": ticket.Status,
+			}
+			results = append(results, ticket)
+		}
+	}
+
+	log.Printf("Search JQL: %s, Found: %d issues", jql, len(results))
+
+	response := map[string]interface{}{
+		"issues":     results,
+		"total":      len(results),
+		"maxResults": 50,
+		"startAt":    0,
+	}
+	json.NewEncoder(w).Encode(response)
+}
+
 func handleReceiveWebhook(w http.ResponseWriter, r *http.Request) {
-	// This simulates your application's webhook endpoint for receiving Jira events
 	var payload map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	// Log the received webhook
-	fmt.Printf("Received webhook from Jira: %v\n", payload)
-
-	// Return success
+	log.Printf("Received webhook from Jira: %v", payload)
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status":"received"}`))
 }
@@ -419,22 +503,18 @@ func triggerWebhook(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	eventType := vars["event_type"]
 
-	// Parse the data from the request
 	var data map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	// Get issue key if provided, or use default
 	issueKey := "AUDIT-1"
 	if key, ok := data["issue_key"].(string); ok && key != "" {
 		issueKey = key
 	}
 
-	// Build webhook payload based on event type
 	var webhookPayload map[string]interface{}
-
 	switch eventType {
 	case "issue_created", "jira:issue_created":
 		webhookPayload = buildIssueWebhookPayload(issueKey, "created", data)
@@ -449,13 +529,11 @@ func triggerWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get the webhook URL from the query parameter or use default
 	webhookURL := r.URL.Query().Get("webhook_url")
 	if webhookURL == "" {
 		webhookURL = "http://localhost:8080/api/webhooks/jira"
 	}
 
-	// Send the webhook
 	jsonPayload, _ := json.Marshal(webhookPayload)
 	resp, err := http.Post(webhookURL, "application/json", strings.NewReader(string(jsonPayload)))
 	if err != nil {
@@ -464,7 +542,6 @@ func triggerWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// Return status
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{
 		"status":     "success",
@@ -475,46 +552,59 @@ func triggerWebhook(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func triggerStatusChangeWebhook(issueKey string, newStatus string) {
-	// Build payload for status change
+func triggerStatusChangeWebhook(issueKey string, newStatus string, previousStatus string) {
 	payload := buildIssueWebhookPayload(issueKey, "updated", map[string]interface{}{
 		"status": newStatus,
 	})
 
-	// Add changelog info
+	// Dynamic changelog based on previous and new status
+	var fromID, toID string
+	switch previousStatus {
+	case "To Do":
+		fromID = "1"
+	case "In Progress":
+		fromID = "3"
+	case "Done":
+		fromID = "5"
+	}
+	switch newStatus {
+	case "To Do":
+		toID = "1"
+	case "In Progress":
+		toID = "3"
+	case "Done":
+		toID = "5"
+	}
+
 	payload["changelog"] = map[string]interface{}{
 		"items": []map[string]interface{}{
 			{
 				"field":      "status",
 				"fieldtype":  "jira",
-				"from":       "3",
-				"fromString": "In Progress", // This is just a placeholder
-				"to":         "5",
+				"from":       fromID,
+				"fromString": previousStatus,
+				"to":         toID,
 				"toString":   newStatus,
 			},
 		},
 	}
 
-	// Get default webhook URL
 	webhookURL := "http://localhost:8080/api/webhooks/jira"
-
-	// Send the webhook
 	jsonPayload, _ := json.Marshal(payload)
 	resp, err := http.Post(webhookURL, "application/json", strings.NewReader(string(jsonPayload)))
 	if err != nil {
-		fmt.Printf("Error sending status change webhook: %v\n", err)
+		log.Printf("Error sending status change webhook: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	fmt.Printf("Status change webhook sent for issue %s (new status: %s)\n", issueKey, newStatus)
+	log.Printf("Status change webhook sent for issue %s (from %s to %s)", issueKey, previousStatus, newStatus)
 }
 
 func buildIssueWebhookPayload(issueKey string, action string, data map[string]interface{}) map[string]interface{} {
 	tickets := MockDatabase["tickets"].(map[string]JiraTicket)
 	ticket, exists := tickets[issueKey]
 
-	// Use default fields if the ticket doesn't exist
 	summary := "Mock issue"
 	description := "This is a mock issue for testing"
 	status := "To Do"
@@ -525,7 +615,6 @@ func buildIssueWebhookPayload(issueKey string, action string, data map[string]in
 		status = ticket.Status
 	}
 
-	// Override with provided data
 	if s, ok := data["summary"].(string); ok && s != "" {
 		summary = s
 	}
@@ -536,19 +625,19 @@ func buildIssueWebhookPayload(issueKey string, action string, data map[string]in
 		status = s
 	}
 
-	// Build the issue fields
 	issueFields := map[string]interface{}{
 		"summary":     summary,
 		"description": description,
 		"status": map[string]interface{}{
-			"id":   "3", // Just a placeholder ID
+			"id":   "3", // Default ID, updated in changelog
 			"name": status,
 		},
 	}
 
-	// Add ServiceNow ID if provided
 	if snID, ok := data["servicenow_id"].(string); ok && snID != "" {
 		issueFields["customfield_servicenow_id"] = snID
+	} else if exists && ticket.Fields["customfield_servicenow_id"] != nil {
+		issueFields["customfield_servicenow_id"] = ticket.Fields["customfield_servicenow_id"]
 	}
 
 	return map[string]interface{}{
@@ -593,6 +682,14 @@ func buildCommentWebhookPayload(issueKey string, action string, data map[string]
 	}
 
 	return issuePayload
+}
+
+func handleReset(w http.ResponseWriter, r *http.Request) {
+	MockDatabase["tickets"] = map[string]JiraTicket{}
+	ServiceNowJiraMapping = map[string]string{}
+	log.Printf("Mock Jira database reset")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"reset"}`))
 }
 
 func handleUI(w http.ResponseWriter, r *http.Request) {
@@ -683,13 +780,14 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                         <li><strong>Comments API:</strong> http://localhost:3001/rest/api/2/issue/{key}/comment</li>
                         <li><strong>Transitions API:</strong> http://localhost:3001/rest/api/2/issue/{key}/transitions</li>
                         <li><strong>Projects API:</strong> http://localhost:3001/rest/api/2/project</li>
+                        <li><strong>Search API:</strong> http://localhost:3001/rest/api/2/search</li>
                         <li><strong>Webhook Trigger:</strong> http://localhost:3001/trigger_webhook/{event_type}</li>
+                        <li><strong>Reset Database:</strong> http://localhost:3001/reset (POST)</li>
                     </ul>
                 </div>
             </div>
             
             <script>
-                // Handle form submissions
                 document.getElementById('issueCreateForm').addEventListener('submit', function(e) {
                     e.preventDefault();
                     const data = {
@@ -697,24 +795,16 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                         description: this.elements.description.value,
                         servicenow_id: this.elements.servicenow_id.value,
                     };
-                    
                     const webhookURL = this.elements.webhook_url.value;
                     const url = '/trigger_webhook/issue_created' + (webhookURL ? '?webhook_url=' + encodeURIComponent(webhookURL) : '');
-                    
                     fetch(url, {
                         method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
+                        headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify(data)
                     })
                     .then(response => response.json())
-                    .then(data => {
-                        alert('Webhook sent successfully: ' + JSON.stringify(data));
-                    })
-                    .catch(error => {
-                        alert('Error sending webhook: ' + error);
-                    });
+                    .then(data => alert('Webhook sent successfully: ' + JSON.stringify(data)))
+                    .catch(error => alert('Error sending webhook: ' + error));
                 });
                 
                 document.getElementById('issueUpdateForm').addEventListener('submit', function(e) {
@@ -723,24 +813,16 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                         issue_key: this.elements.issue_key.value,
                         status: this.elements.status.value,
                     };
-                    
                     const webhookURL = this.elements.webhook_url.value;
                     const url = '/trigger_webhook/issue_updated' + (webhookURL ? '?webhook_url=' + encodeURIComponent(webhookURL) : '');
-                    
                     fetch(url, {
                         method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
+                        headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify(data)
                     })
                     .then(response => response.json())
-                    .then(data => {
-                        alert('Webhook sent successfully: ' + JSON.stringify(data));
-                    })
-                    .catch(error => {
-                        alert('Error sending webhook: ' + error);
-                    });
+                    .then(data => alert('Webhook sent successfully: ' + JSON.stringify(data)))
+                    .catch(error => alert('Error sending webhook: ' + error));
                 });
                 
                 document.getElementById('commentCreateForm').addEventListener('submit', function(e) {
@@ -749,24 +831,16 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                         issue_key: this.elements.issue_key.value,
                         comment: this.elements.comment.value,
                     };
-                    
                     const webhookURL = this.elements.webhook_url.value;
                     const url = '/trigger_webhook/comment_created' + (webhookURL ? '?webhook_url=' + encodeURIComponent(webhookURL) : '');
-                    
                     fetch(url, {
                         method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
+                        headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify(data)
                     })
                     .then(response => response.json())
-                    .then(data => {
-                        alert('Webhook sent successfully: ' + JSON.stringify(data));
-                    })
-                    .catch(error => {
-                        alert('Error sending webhook: ' + error);
-                    });
+                    .then(data => alert('Webhook sent successfully: ' + JSON.stringify(data)))
+                    .catch(error => alert('Error sending webhook: ' + error));
                 });
             </script>
         </body>
