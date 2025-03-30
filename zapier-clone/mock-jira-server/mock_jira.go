@@ -98,7 +98,7 @@ func main() {
 	r.HandleFunc("/", handleUI).Methods("GET")
 
 	// Start server
-	port := "3001"
+	port := "5000"
 	fmt.Printf("Starting mock Jira server on port %s...\n", port)
 	log.Fatal(http.ListenAndServe(":"+port, r))
 }
