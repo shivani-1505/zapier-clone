@@ -80,16 +80,303 @@ func handleCreateRisk(w http.ResponseWriter, r *http.Request) {
 		MockDatabase["risks"] = make(map[string]interface{})
 	}
 
-	// Store the risk in our mock database
 	MockDatabase["risks"][sysID] = riskData
 
 	// Send a webhook to sync this with Jira
 	go triggerWebhook("sn_risk_risk", sysID, "insert", riskData)
 
+	// Also send a notification directly to Slack
+	go sendSlackNotification(riskData)
+
 	// Return the created risk
 	json.NewEncoder(w).Encode(ResponseResult{Result: riskData})
 }
 
+// Generic function to send Slack notifications for any GRC item
+func sendGenericSlackNotification(itemType string, itemData map[string]interface{}) {
+	// Log the beginning of the function
+	log.Printf("[SERVICENOW] Beginning to send Slack notification for %s: %v", itemType, itemData["number"])
+
+	// Extract common fields, with fallbacks for different field names
+	title := ""
+	if shortDesc, ok := itemData["short_description"].(string); ok && shortDesc != "" {
+		title = shortDesc
+	} else if itemTitle, ok := itemData["title"].(string); ok && itemTitle != "" {
+		title = itemTitle
+	} else {
+		title = "New " + itemType
+	}
+
+	description := ""
+	if desc, ok := itemData["description"].(string); ok {
+		description = desc
+	}
+
+	severity := "Unknown"
+	if sev, ok := itemData["severity"].(string); ok {
+		severity = sev
+	}
+
+	itemNumber := ""
+	if num, ok := itemData["number"].(string); ok && num != "" {
+		itemNumber = num
+	} else if sysID, ok := itemData["sys_id"].(string); ok {
+		itemNumber = sysID
+	}
+
+	// Determine the appropriate channel based on item type
+	channelID := "C12345" // default to general
+	switch itemType {
+	case "risk":
+		channelID = "C67890" // risk-management
+	case "incident":
+		channelID = "C22222" // incident-response
+	case "compliance_task":
+		channelID = "C11111" // compliance-team
+	case "audit_finding":
+		channelID = "C54321" // audit
+	case "control_test":
+		channelID = "C66666" // control-testing
+	case "vendor_risk":
+		channelID = "C33333" // vendor-risk
+	case "regulatory_change":
+		channelID = "C44444" // regulatory-updates
+	}
+
+	// Log the extracted details
+	log.Printf("[SERVICENOW] Item details - Title: %s, Severity: %s, Number: %s",
+		title, severity, itemNumber)
+
+	// Create appropriate message format
+	message := fmt.Sprintf("*New %s: %s*\n*ID:* %s", itemType, title, itemNumber)
+
+	if severity != "Unknown" {
+		message += fmt.Sprintf("\n*Severity:* %s", severity)
+	}
+
+	if description != "" {
+		message += fmt.Sprintf("\n*Description:* %s", description)
+	}
+
+	// Add any item-specific fields
+	switch itemType {
+	case "compliance_task":
+		if framework, ok := itemData["compliance_framework"].(string); ok {
+			message += fmt.Sprintf("\n*Framework:* %s", framework)
+		}
+		if dueDate, ok := itemData["due_date"].(string); ok {
+			message += fmt.Sprintf("\n*Due Date:* %s", dueDate)
+		}
+	case "control_test":
+		if controlName, ok := itemData["control_name"].(string); ok {
+			message += fmt.Sprintf("\n*Control:* %s", controlName)
+		}
+		if framework, ok := itemData["framework"].(string); ok {
+			message += fmt.Sprintf("\n*Framework:* %s", framework)
+		}
+	case "audit_finding":
+		if auditName, ok := itemData["audit_name"].(string); ok {
+			message += fmt.Sprintf("\n*Audit:* %s", auditName)
+		}
+	case "vendor_risk":
+		if vendorName, ok := itemData["vendor_name"].(string); ok {
+			message += fmt.Sprintf("\n*Vendor:* %s", vendorName)
+		}
+	case "regulatory_change":
+		if regName, ok := itemData["regulation_name"].(string); ok {
+			message += fmt.Sprintf("\n*Regulation:* %s", regName)
+		}
+		if jurisdiction, ok := itemData["jurisdiction"].(string); ok {
+			message += fmt.Sprintf("\n*Jurisdiction:* %s", jurisdiction)
+		}
+	}
+
+	// Create appropriate action buttons based on item type
+	var actionElements []map[string]interface{}
+
+	switch itemType {
+	case "risk":
+		actionElements = []map[string]interface{}{
+			{
+				"type": "button",
+				"text": map[string]interface{}{
+					"type": "plain_text",
+					"text": "Discuss Mitigation",
+				},
+				"action_id": "discuss_risk",
+				"value":     "discuss_" + itemNumber,
+			},
+			{
+				"type": "button",
+				"text": map[string]interface{}{
+					"type": "plain_text",
+					"text": "Assign Owner",
+				},
+				"action_id": "assign_risk",
+				"value":     "assign_" + itemNumber,
+			},
+		}
+	case "incident":
+		actionElements = []map[string]interface{}{
+			{
+				"type": "button",
+				"text": map[string]interface{}{
+					"type": "plain_text",
+					"text": "🚨 Acknowledge",
+				},
+				"action_id": "acknowledge_incident",
+				"value":     "ack_incident_" + itemNumber,
+			},
+			{
+				"type": "button",
+				"text": map[string]interface{}{
+					"type": "plain_text",
+					"text": "📝 Add Update",
+				},
+				"action_id": "update_incident",
+				"value":     "update_" + itemNumber,
+			},
+			{
+				"type": "button",
+				"text": map[string]interface{}{
+					"type": "plain_text",
+					"text": "✅ Resolve",
+				},
+				"action_id": "resolve_incident",
+				"value":     "resolve_" + itemNumber,
+			},
+		}
+	case "audit_finding":
+		actionElements = []map[string]interface{}{
+			{
+				"type": "button",
+				"text": map[string]interface{}{
+					"type": "plain_text",
+					"text": "Assign Owner",
+				},
+				"action_id": "assign_finding",
+				"value":     "assign_finding_" + itemNumber,
+			},
+			{
+				"type": "button",
+				"text": map[string]interface{}{
+					"type": "plain_text",
+					"text": "Resolve Finding",
+				},
+				"action_id": "resolve_finding",
+				"value":     "resolve_finding_" + itemNumber,
+			},
+		}
+	case "control_test":
+		actionElements = []map[string]interface{}{
+			{
+				"type": "button",
+				"text": map[string]interface{}{
+					"type": "plain_text",
+					"text": "Submit Results",
+				},
+				"action_id": "submit_test_results",
+				"value":     "test_results_" + itemNumber,
+			},
+		}
+	case "vendor_risk":
+		actionElements = []map[string]interface{}{
+			{
+				"type": "button",
+				"text": map[string]interface{}{
+					"type": "plain_text",
+					"text": "Request Report",
+				},
+				"action_id": "request_compliance_report",
+				"value":     "request_report_" + itemNumber,
+			},
+			{
+				"type": "button",
+				"text": map[string]interface{}{
+					"type": "plain_text",
+					"text": "Update Status",
+				},
+				"action_id": "update_vendor_status",
+				"value":     "update_vendor_" + itemNumber,
+			},
+		}
+	case "regulatory_change":
+		actionElements = []map[string]interface{}{
+			{
+				"type": "button",
+				"text": map[string]interface{}{
+					"type": "plain_text",
+					"text": "Add Impact Assessment",
+				},
+				"action_id": "add_impact_assessment",
+				"value":     "assess_impact_" + itemNumber,
+			},
+			{
+				"type": "button",
+				"text": map[string]interface{}{
+					"type": "plain_text",
+					"text": "Create Implementation Plan",
+				},
+				"action_id": "create_implementation_plan",
+				"value":     "plan_" + itemNumber,
+			},
+		}
+	}
+
+	// Prepare the Slack message payload
+	data := map[string]interface{}{
+		"channel": channelID,
+		"text":    message,
+		"blocks": []map[string]interface{}{
+			{
+				"type": "section",
+				"text": map[string]interface{}{
+					"type": "mrkdwn",
+					"text": message,
+				},
+			},
+		},
+	}
+
+	// Add action buttons if available
+	if len(actionElements) > 0 {
+		data["blocks"] = append(data["blocks"].([]map[string]interface{}), map[string]interface{}{
+			"type":     "actions",
+			"elements": actionElements,
+		})
+	}
+
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("[SERVICENOW] ERROR: Failed to marshal Slack notification JSON: %v", err)
+		return
+	}
+
+	log.Printf("[SERVICENOW] Sending Slack notification payload: %s", string(jsonData))
+
+	resp, err := http.Post("http://localhost:3002/api/chat.postMessage", "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Printf("[SERVICENOW] ERROR: Failed to send Slack notification: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	log.Printf("[SERVICENOW] Slack notification response: %s", string(respBody))
+
+	// Check if the response was successful
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[SERVICENOW] ERROR: Slack responded with non-OK status code: %d", resp.StatusCode)
+	} else {
+		log.Printf("[SERVICENOW] Successfully sent notification to Slack")
+	}
+}
+
+// Inside your servicenow_mock.go, add this function:
+// Original sendSlackNotification can just call the generic function for risks
+func sendSlackNotification(riskData map[string]interface{}) {
+	sendGenericSlackNotification("risk", riskData)
+}
 func main() {
 	r := mux.NewRouter()
 
@@ -137,63 +424,505 @@ func main() {
 			`table, th, td { border: 1px solid #ddd; } th, td { padding: 10px; text-align: left; }` +
 			`th { background-color: #f2f2f2; } .risk-high { background-color: #ffebee; }` +
 			`.risk-medium { background-color: #fff8e1; } .risk-low { background-color: #e8f5e9; }` +
-			`.button { display: inline-block; padding: 8px 16px; background: #0057a6; color: white; text-decoration: none; border-radius: 4px; }` +
+			`.button { display: inline-block; padding: 8px 16px; background: #0057a6; color: white; text-decoration: none; border-radius: 4px; cursor: pointer; border: none; }` +
+			`.tab-container { border-bottom: 1px solid #ddd; margin-bottom: 20px; }` +
+			`.tab { display: inline-block; padding: 10px 15px; cursor: pointer; }` +
+			`.tab.active { background: #0057a6; color: white; }` +
+			`.tab-content { display: none; }` +
+			`.tab-content.active { display: block; }` +
+			`form div { margin-bottom: 10px; }` +
+			`input, select, textarea { width: 100%; padding: 8px; box-sizing: border-box; }` +
+			`.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }` +
+			`@media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }` +
 			`</style></head><body><div class="header"><div class="container">` +
-			`<h1>ServiceNow GRC - Risk Management</h1></div></div>` +
-			`<div class="container"><div class="card"><h2>Risk Dashboard</h2><div id="grc-summary"></div></div>` +
+			`<h1>ServiceNow GRC Platform</h1></div></div>` +
+			`<div class="container">` +
+			`<div class="card"><h2>GRC Dashboard</h2><div id="grc-summary"></div></div>` +
+
+			// Tab navigation
+			`<div class="tab-container">` +
+			`<div class="tab active" data-tab="risks">Risks</div>` +
+			`<div class="tab" data-tab="compliance">Compliance Tasks</div>` +
+			`<div class="tab" data-tab="incidents">Incidents</div>` +
+			`<div class="tab" data-tab="audit">Audit Findings</div>` +
+			`<div class="tab" data-tab="control">Control Tests</div>` +
+			`<div class="tab" data-tab="vendor">Vendor Risks</div>` +
+			`<div class="tab" data-tab="regulatory">Regulatory Changes</div>` +
+			`</div>` +
+
+			// Risk tab
+			`<div class="tab-content active" id="risks-tab">` +
 			`<div class="card"><h2>Risk Register</h2><table id="risk-table"><thead><tr>` +
 			`<th>ID</th><th>Title</th><th>Severity</th><th>Category</th><th>Owner</th><th>Status</th><th>Created</th>` +
 			`</tr></thead><tbody id="risk-data"></tbody></table></div>` +
 			`<div class="card"><h2>Add New Risk</h2><form id="risk-form">` +
-			`<div style="display: flex; flex-wrap: wrap; gap: 10px;">` +
-			`<div style="flex: 1;"><label>Title:</label><br>` +
-			`<input type="text" name="title" style="width: 100%; padding: 8px;" required></div>` +
-			`<div style="flex: 1;"><label>Severity:</label><br>` +
-			`<select name="severity" style="width: 100%; padding: 8px;" required>` +
-			`<option value="High">High</option><option value="Medium">Medium</option><option value="Low">Low</option>` +
-			`</select></div></div><div style="margin-top: 10px;"><label>Description:</label><br>` +
-			`<textarea name="description" style="width: 100%; padding: 8px;" rows="3" required></textarea></div>` +
-			`<div style="display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px;">` +
-			`<div style="flex: 1;"><label>Category:</label><br>` +
-			`<select name="category" style="width: 100%; padding: 8px;" required>` +
+			`<div class="grid">` +
+			`<div><label>Title:</label><input type="text" name="title" required></div>` +
+			`<div><label>Severity:</label><select name="severity" required>` +
+			`<option value="Critical">Critical</option><option value="High">High</option><option value="Medium">Medium</option><option value="Low">Low</option>` +
+			`</select></div></div><div><label>Description:</label>` +
+			`<textarea name="description" rows="3" required></textarea></div>` +
+			`<div class="grid">` +
+			`<div><label>Category:</label><select name="category" required>` +
 			`<option value="Cybersecurity">Cybersecurity</option><option value="Financial">Financial</option>` +
 			`<option value="Operational">Operational</option><option value="Compliance">Compliance</option>` +
 			`<option value="Strategic">Strategic</option></select></div>` +
-			`<div style="flex: 1;"><label>Owner:</label><br>` +
-			`<input type="text" name="owner" style="width: 100%; padding: 8px;" required></div></div>` +
-			`<div style="margin-top: 15px;"><button type="submit" class="button">Create Risk</button></div>` +
-			`</form></div></div>` +
-			`<script>function loadRisks() { fetch('/api/now/table/sn_risk_risk')` +
-			`.then(response => response.json()).then(data => { const riskData = document.getElementById('risk-data');` +
-			`riskData.innerHTML = ''; if (data.result && data.result.length) { data.result.forEach(risk => {` +
-			`const row = document.createElement('tr'); if (risk.severity === 'High') { row.className = 'risk-high'; }` +
-			`else if (risk.severity === 'Medium') { row.className = 'risk-medium'; } else { row.className = 'risk-low'; }` +
-			`row.innerHTML = '<td>' + (risk.number || risk.sys_id) + '</td><td>' + (risk.title || 'Untitled') + '</td>' +` +
-			`'<td>' + (risk.severity || 'Unknown') + '</td><td>' + (risk.category || 'Uncategorized') + '</td>' +` +
-			`'<td>' + (risk.owner || 'Unassigned') + '</td><td>' + (risk.status || 'New') + '</td>' +` +
-			`'<td>' + (new Date(risk.created_on).toLocaleDateString() || 'Unknown') + '</td>';` +
-			`riskData.appendChild(row); }); } else { riskData.innerHTML = '<tr><td colspan="7" style="text-align: center;">No risks found</td></tr>'; } }); }` +
-			`function loadSummary() { fetch('/api/now/table/sn_grc_summary')` +
-			`.then(response => response.json()).then(data => { const summary = data.result;` +
-			`const summaryDiv = document.getElementById('grc-summary');` +
-			`summaryDiv.innerHTML = '<div style="display: flex; flex-wrap: wrap; gap: 15px;">' +` +
-			`'<div style="flex: 1; text-align: center; padding: 15px; background: #e3f2fd; border-radius: 4px;">' +` +
-			`'<div style="font-size: 32px; font-weight: bold;">' + (summary.open_risks || 0) + '</div><div>Open Risks</div></div>' +` +
-			`'<div style="flex: 1; text-align: center; padding: 15px; background: #e8f5e9; border-radius: 4px;">' +` +
-			`'<div style="font-size: 32px; font-weight: bold;">' + (summary.compliance_score || 0) + '%</div><div>Compliance Score</div></div>' +` +
-			`'<div style="flex: 1; text-align: center; padding: 15px; background: #fff8e1; border-radius: 4px;">' +` +
-			`'<div style="font-size: 32px; font-weight: bold;">' + (summary.open_compliance_tasks || 0) + '</div><div>Open Tasks</div></div>' +` +
-			`'<div style="flex: 1; text-align: center; padding: 15px; background: #fce4ec; border-radius: 4px;">' +` +
-			`'<div style="font-size: 32px; font-weight: bold;">' + (summary.overdue_items || 0) + '</div><div>Overdue Items</div></div>' +` +
-			`'</div>'; }); }` +
-			`document.getElementById('risk-form').addEventListener('submit', function(e) { e.preventDefault();` +
-			`const formData = new FormData(this); const risk = { title: formData.get('title'), description: formData.get('description'),` +
-			`severity: formData.get('severity'), category: formData.get('category'), owner: formData.get('owner'), status: 'Open' };` +
-			`fetch('/servicenow/create_risk', { method: 'POST', headers: { 'Content-Type': 'application/json' },` +
-			`body: JSON.stringify(risk) }).then(response => response.json()).then(data => { alert('Risk created successfully!');` +
-			`this.reset(); loadRisks(); loadSummary(); }).catch(error => { console.error('Error creating risk:', error);` +
-			`alert('Failed to create risk. See console for details.'); }); }); loadRisks(); loadSummary();` +
-			`</script></body></html>`
+			`<div><label>Owner:</label><input type="text" name="owner" required></div></div>` +
+			`<div><button type="submit" class="button">Create Risk</button></div>` +
+			`</form></div>` +
+			`</div>` +
+
+			// Compliance Tasks tab
+			`<div class="tab-content" id="compliance-tab">` +
+			`<div class="card"><h2>Compliance Tasks</h2><table id="compliance-table"><thead><tr>` +
+			`<th>ID</th><th>Title</th><th>Framework</th><th>Assigned To</th><th>Due Date</th><th>Status</th>` +
+			`</tr></thead><tbody id="compliance-data"></tbody></table></div>` +
+			`<div class="card"><h2>Add New Compliance Task</h2><form id="compliance-form">` +
+			`<div class="grid">` +
+			`<div><label>Title:</label><input type="text" name="short_description" required></div>` +
+			`<div><label>Framework:</label><select name="compliance_framework" required>` +
+			`<option value="GDPR">GDPR</option><option value="HIPAA">HIPAA</option><option value="PCI-DSS">PCI-DSS</option>` +
+			`<option value="SOX">SOX</option><option value="NIST">NIST</option></select></div></div>` +
+			`<div><label>Description:</label><textarea name="description" rows="3" required></textarea></div>` +
+			`<div class="grid">` +
+			`<div><label>Assigned To:</label><input type="text" name="assigned_to" required></div>` +
+			`<div><label>Due Date:</label><input type="date" name="due_date" required></div></div>` +
+			`<div><button type="submit" class="button">Create Compliance Task</button></div>` +
+			`</form></div>` +
+			`</div>` +
+
+			// Incidents tab
+			`<div class="tab-content" id="incidents-tab">` +
+			`<div class="card"><h2>Incidents</h2><table id="incident-table"><thead><tr>` +
+			`<th>ID</th><th>Title</th><th>Severity</th><th>Category</th><th>Status</th><th>Created</th>` +
+			`</tr></thead><tbody id="incident-data"></tbody></table></div>` +
+			`<div class="card"><h2>Add New Incident</h2><form id="incident-form">` +
+			`<div class="grid">` +
+			`<div><label>Title:</label><input type="text" name="short_description" required></div>` +
+			`<div><label>Severity:</label><select name="severity" required>` +
+			`<option value="Critical">Critical</option><option value="High">High</option><option value="Medium">Medium</option><option value="Low">Low</option>` +
+			`</select></div></div>` +
+			`<div><label>Description:</label><textarea name="description" rows="3" required></textarea></div>` +
+			`<div class="grid">` +
+			`<div><label>Category:</label><select name="category" required>` +
+			`<option value="Security">Security</option><option value="Hardware">Hardware</option>` +
+			`<option value="Software">Software</option><option value="Network">Network</option>` +
+			`<option value="Database">Database</option></select></div>` +
+			`<div><label>Impact:</label><select name="impact" required>` +
+			`<option value="High">High</option><option value="Medium">Medium</option><option value="Low">Low</option>` +
+			`</select></div></div>` +
+			`<div><button type="submit" class="button">Create Incident</button></div>` +
+			`</form></div>` +
+			`</div>` +
+
+			// Audit Findings tab
+			`<div class="tab-content" id="audit-tab">` +
+			`<div class="card"><h2>Audit Findings</h2><table id="audit-table"><thead><tr>` +
+			`<th>ID</th><th>Title</th><th>Audit Name</th><th>Severity</th><th>Due Date</th><th>Status</th>` +
+			`</tr></thead><tbody id="audit-data"></tbody></table></div>` +
+			`<div class="card"><h2>Add New Audit Finding</h2><form id="audit-form">` +
+			`<div class="grid">` +
+			`<div><label>Title:</label><input type="text" name="short_description" required></div>` +
+			`<div><label>Audit Name:</label><input type="text" name="audit_name" required></div></div>` +
+			`<div><label>Description:</label><textarea name="description" rows="3" required></textarea></div>` +
+			`<div class="grid">` +
+			`<div><label>Severity:</label><select name="severity" required>` +
+			`<option value="High">High</option><option value="Medium">Medium</option><option value="Low">Low</option>` +
+			`</select></div>` +
+			`<div><label>Due Date:</label><input type="date" name="due_date" required></div></div>` +
+			`<div><button type="submit" class="button">Create Audit Finding</button></div>` +
+			`</form></div>` +
+			`</div>` +
+
+			// Control Tests tab
+			`<div class="tab-content" id="control-tab">` +
+			`<div class="card"><h2>Control Tests</h2><table id="control-table"><thead><tr>` +
+			`<th>ID</th><th>Title</th><th>Control Name</th><th>Framework</th><th>Due Date</th><th>Status</th>` +
+			`</tr></thead><tbody id="control-data"></tbody></table></div>` +
+			`<div class="card"><h2>Add New Control Test</h2><form id="control-form">` +
+			`<div class="grid">` +
+			`<div><label>Title:</label><input type="text" name="short_description" required></div>` +
+			`<div><label>Control Name:</label><input type="text" name="control_name" required></div></div>` +
+			`<div><label>Description:</label><textarea name="description" rows="3" required></textarea></div>` +
+			`<div class="grid">` +
+			`<div><label>Framework:</label><select name="framework" required>` +
+			`<option value="SOX">SOX</option><option value="NIST">NIST</option>` +
+			`<option value="ISO 27001">ISO 27001</option><option value="PCI-DSS">PCI-DSS</option>` +
+			`</select></div>` +
+			`<div><label>Due Date:</label><input type="date" name="due_date" required></div></div>` +
+			`<div><button type="submit" class="button">Create Control Test</button></div>` +
+			`</form></div>` +
+			`</div>` +
+
+			// Vendor Risks tab
+			`<div class="tab-content" id="vendor-tab">` +
+			`<div class="card"><h2>Vendor Risks</h2><table id="vendor-table"><thead><tr>` +
+			`<th>ID</th><th>Title</th><th>Vendor</th><th>Severity</th><th>Due Date</th><th>Status</th>` +
+			`</tr></thead><tbody id="vendor-data"></tbody></table></div>` +
+			`<div class="card"><h2>Add New Vendor Risk</h2><form id="vendor-form">` +
+			`<div class="grid">` +
+			`<div><label>Title:</label><input type="text" name="short_description" required></div>` +
+			`<div><label>Vendor Name:</label><input type="text" name="vendor_name" required></div></div>` +
+			`<div><label>Description:</label><textarea name="description" rows="3" required></textarea></div>` +
+			`<div class="grid">` +
+			`<div><label>Severity:</label><select name="severity" required>` +
+			`<option value="High">High</option><option value="Medium">Medium</option><option value="Low">Low</option>` +
+			`</select></div>` +
+			`<div><label>Due Date:</label><input type="date" name="due_date" required></div></div>` +
+			`<div><button type="submit" class="button">Create Vendor Risk</button></div>` +
+			`</form></div>` +
+			`</div>` +
+
+			// Regulatory Changes tab
+			`<div class="tab-content" id="regulatory-tab">` +
+			`<div class="card"><h2>Regulatory Changes</h2><table id="regulatory-table"><thead><tr>` +
+			`<th>ID</th><th>Title</th><th>Regulation</th><th>Jurisdiction</th><th>Effective Date</th><th>Status</th>` +
+			`</tr></thead><tbody id="regulatory-data"></tbody></table></div>` +
+			`<div class="card"><h2>Add New Regulatory Change</h2><form id="regulatory-form">` +
+			`<div class="grid">` +
+			`<div><label>Title:</label><input type="text" name="short_description" required></div>` +
+			`<div><label>Regulation Name:</label><input type="text" name="regulation_name" required></div></div>` +
+			`<div><label>Description:</label><textarea name="description" rows="3" required></textarea></div>` +
+			`<div class="grid">` +
+			`<div><label>Jurisdiction:</label><input type="text" name="jurisdiction" required></div>` +
+			`<div><label>Effective Date:</label><input type="date" name="effective_date" required></div></div>` +
+			`<div><button type="submit" class="button">Create Regulatory Change</button></div>` +
+			`</form></div>` +
+			`</div>` +
+
+			`</div>` + // End of container
+
+			`<script>
+			// Tab switching
+			document.addEventListener('DOMContentLoaded', function() {
+				const tabs = document.querySelectorAll('.tab');
+				tabs.forEach(tab => {
+					tab.addEventListener('click', function() {
+						// Remove active class from all tabs
+						tabs.forEach(t => t.classList.remove('active'));
+						
+						// Add active class to clicked tab
+						this.classList.add('active');
+						
+						// Hide all tab content
+						document.querySelectorAll('.tab-content').forEach(content => {
+							content.classList.remove('active');
+						});
+						
+						// Show corresponding tab content
+						const tabId = this.getAttribute('data-tab') + '-tab';
+						document.getElementById(tabId).classList.add('active');
+					});
+				});
+				
+				// Load data for all tables
+				loadAllData();
+				loadSummary();
+				
+				// Risk form submission
+				document.getElementById('risk-form').addEventListener('submit', function(e) {
+					e.preventDefault();
+					submitForm(this, '/servicenow/create_risk', function() {
+						loadRisks();
+						loadSummary();
+					});
+				});
+				
+				// Compliance form submission
+				document.getElementById('compliance-form').addEventListener('submit', function(e) {
+					e.preventDefault();
+					submitForm(this, '/api/now/table/sn_compliance_task', function() {
+						loadComplianceTasks();
+						loadSummary();
+					});
+				});
+				
+				// Incident form submission
+				document.getElementById('incident-form').addEventListener('submit', function(e) {
+					e.preventDefault();
+					submitForm(this, '/api/now/table/sn_si_incident', function() {
+						loadIncidents();
+						loadSummary();
+					});
+				});
+				
+				// Audit form submission
+				document.getElementById('audit-form').addEventListener('submit', function(e) {
+					e.preventDefault();
+					submitForm(this, '/api/now/table/sn_audit_finding', function() {
+						loadAuditFindings();
+						loadSummary();
+					});
+				});
+				
+				// Control test form submission
+				document.getElementById('control-form').addEventListener('submit', function(e) {
+					e.preventDefault();
+					submitForm(this, '/api/now/table/sn_policy_control_test', function() {
+						loadControlTests();
+						loadSummary();
+					});
+				});
+				
+				// Vendor risk form submission
+				document.getElementById('vendor-form').addEventListener('submit', function(e) {
+					e.preventDefault();
+					submitForm(this, '/api/now/table/sn_vendor_risk', function() {
+						loadVendorRisks();
+						loadSummary();
+					});
+				});
+				
+				// Regulatory change form submission
+				document.getElementById('regulatory-form').addEventListener('submit', function(e) {
+					e.preventDefault();
+					submitForm(this, '/api/now/table/sn_regulatory_change', function() {
+						loadRegulatoryChanges();
+						loadSummary();
+					});
+				});
+			});
+			
+			// Generic form submission function
+			function submitForm(form, url, callback) {
+				const formData = new FormData(form);
+				const data = {};
+				
+				formData.forEach((value, key) => {
+					// Handle date format conversion
+					if (key.includes('date') && value) {
+						data[key] = new Date(value).toISOString();
+					} else {
+						data[key] = value;
+					}
+				});
+				
+				// If it's a ServiceNow form, add status
+				if (!url.includes('create_risk')) {
+					data.status = 'Open';
+				}
+				
+				fetch(url, {
+					method: 'POST', 
+					headers: {'Content-Type': 'application/json'},
+					body: JSON.stringify(data)
+				})
+				.then(response => response.json())
+				.then(result => {
+					alert('Item created successfully!');
+					form.reset();
+					if (callback) callback();
+				})
+				.catch(error => {
+					console.error('Error creating item:', error);
+					alert('Failed to create item. See console for details.');
+				});
+			}
+			
+			// Load all data
+			function loadAllData() {
+				loadRisks();
+				loadComplianceTasks();
+				loadIncidents();
+				loadAuditFindings();
+				loadControlTests();
+				loadVendorRisks();
+				loadRegulatoryChanges();
+			}
+			
+			// Load risks
+			// --------- REPLACE THESE EXISTING FUNCTIONS WITH THE NEW ONES ---------
+function loadRisks() {
+    fetchTableData('/api/now/table/sn_risk_risk', 'risk-data', 
+        item => [
+            item.number || item.sys_id,
+            item.title || 'Untitled',
+            item.severity || 'Unknown',
+            item.category || 'Uncategorized',
+            item.owner || 'Unassigned',
+            item.status || 'New',
+            new Date(item.created_on).toLocaleDateString() || 'Unknown'
+        ],
+        item => item.severity === 'Critical' || item.severity === 'High' ? 'risk-high' : 
+               item.severity === 'Medium' ? 'risk-medium' : 'risk-low'
+    );
+}
+
+function loadComplianceTasks() {
+    fetchTableData('/api/now/table/sn_compliance_task', 'compliance-data', 
+        item => [
+            item.number || item.sys_id,
+            item.short_description || 'Untitled',
+            item.compliance_framework || 'Unknown',
+            item.assigned_to || 'Unassigned',
+            new Date(item.due_date).toLocaleDateString() || 'No date',
+            item.status || 'New'
+        ]
+    );
+}
+
+// (Similar replacements for other load functions: loadIncidents, loadAuditFindings, etc.)
+			
+			// Load incidents
+			function loadIncidents() {
+				fetchTableData('/api/now/table/sn_si_incident', 'incident-data', 
+					item => [
+						item.number || item.sys_id,
+						item.short_description || 'Untitled',
+						item.severity || 'Unknown',
+						item.category || 'Uncategorized',
+						item.status || 'New',
+						new Date(item.created_on).toLocaleDateString() || 'Unknown'
+					],
+					item => item.severity === 'Critical' || item.severity === 'High' ? 'risk-high' : 
+						   item.severity === 'Medium' ? 'risk-medium' : 'risk-low'
+				);
+			}
+			
+			// Load audit findings
+			function loadAuditFindings() {
+				fetchTableData('/api/now/table/sn_audit_finding', 'audit-data', 
+					item => [
+						item.number || item.sys_id,
+						item.short_description || 'Untitled',
+						item.audit_name || 'Unknown',
+						item.severity || 'Unknown',
+						new Date(item.due_date).toLocaleDateString() || 'No date',
+						item.status || 'New'
+					],
+					item => item.severity === 'High' ? 'risk-high' : 
+						   item.severity === 'Medium' ? 'risk-medium' : 'risk-low'
+				);
+			}
+			
+			// Load control tests
+			function loadControlTests() {
+				fetchTableData('/api/now/table/sn_policy_control_test', 'control-data', 
+					item => [
+						item.number || item.sys_id,
+						item.short_description || 'Untitled',
+						item.control_name || 'Unknown',
+						item.framework || 'Unknown',
+						new Date(item.due_date).toLocaleDateString() || 'No date',
+						item.test_status || 'Open'
+					]
+				);
+			}
+			
+			// Load vendor risks
+			function loadVendorRisks() {
+				fetchTableData('/api/now/table/sn_vendor_risk', 'vendor-data', 
+					item => [
+						item.number || item.sys_id,
+						item.short_description || 'Untitled',
+						item.vendor_name || 'Unknown',
+						item.severity || 'Unknown',
+						new Date(item.due_date).toLocaleDateString() || 'No date',
+						item.status || 'Open'
+					],
+					item => item.severity === 'High' ? 'risk-high' : 
+						   item.severity === 'Medium' ? 'risk-medium' : 'risk-low'
+				);
+			}
+			
+			// Load regulatory changes
+			function loadRegulatoryChanges() {
+				fetchTableData('/api/now/table/sn_regulatory_change', 'regulatory-data', 
+					item => [
+						item.number || item.sys_id,
+						item.short_description || 'Untitled',
+						item.regulation_name || 'Unknown',
+						item.jurisdiction || 'Unknown',
+						new Date(item.effective_date).toLocaleDateString() || 'No date',
+						item.status || 'Open'
+					]
+				);
+			}
+			
+			// Generic function to fetch and display table data
+			function fetchTableData(url, tableId, rowFormatter, rowClassFormatter) {
+				fetch(url)
+				.then(response => response.json())
+				.then(data => {
+					const tableBody = document.getElementById(tableId);
+					tableBody.innerHTML = '';
+					
+					if (data.result && data.result.length) {
+						data.result.forEach(item => {
+							const row = document.createElement('tr');
+							
+							if (rowClassFormatter) {
+								row.className = rowClassFormatter(item);
+							}
+							
+							const cells = rowFormatter(item);
+							cells.forEach(cellContent => {
+								const cell = document.createElement('td');
+								cell.textContent = cellContent;
+								row.appendChild(cell);
+							});
+							
+							tableBody.appendChild(row);
+						});
+					} else {
+						const row = document.createElement('tr');
+						const cell = document.createElement('td');
+						cell.colSpan = '7';
+						cell.style.textAlign = 'center';
+						cell.textContent = 'No items found';
+						row.appendChild(cell);
+						tableBody.appendChild(row);
+					}
+				})
+				.catch(error => {
+					console.error('Error fetching data:', error);
+					const tableBody = document.getElementById(tableId);
+					tableBody.innerHTML = '<tr><td colspan="7" style="text-align: center;">Error loading data</td></tr>';
+				});
+			}
+			
+			// Load GRC summary data
+			function loadSummary() {
+				fetch('/api/now/table/sn_grc_summary')
+				.then(response => response.json())
+				.then(data => {
+					const summary = data.result;
+					const summaryDiv = document.getElementById('grc-summary');
+					
+					summaryDiv.innerHTML = '<div style="display: flex; flex-wrap: wrap; gap: 15px;">' +
+					'<div style="flex: 1; text-align: center; padding: 15px; background: #e3f2fd; border-radius: 4px;">' +
+					'<div style="font-size: 32px; font-weight: bold;">' + (summary.open_risks || 0) + '</div><div>Open Risks</div></div>' +
+					
+					'<div style="flex: 1; text-align: center; padding: 15px; background: #fff8e1; border-radius: 4px;">' +
+					'<div style="font-size: 32px; font-weight: bold;">' + (summary.open_compliance_tasks || 0) + '</div><div>Compliance Tasks</div></div>' +
+					
+					'<div style="flex: 1; text-align: center; padding: 15px; background: #ffebee; border-radius: 4px;">' +
+					'<div style="font-size: 32px; font-weight: bold;">' + (summary.open_incidents || 0) + '</div><div>Incidents</div></div>' +
+					
+					'<div style="flex: 1; text-align: center; padding: 15px; background: #e8f5e9; border-radius: 4px;">' +
+					'<div style="font-size: 32px; font-weight: bold;">' + (summary.compliance_score || 0) + '%</div><div>Compliance Score</div></div>' +
+					'</div>' +
+					
+					'<div style="display: flex; flex-wrap: wrap; gap: 15px; margin-top: 15px;">' +
+					'<div style="flex: 1; text-align: center; padding: 15px; background: #f3e5f5; border-radius: 4px;">' +
+					'<div style="font-size: 32px; font-weight: bold;">' + (summary.open_audit_findings || 0) + '</div><div>Audit Findings</div></div>' +
+					
+					'<div style="flex: 1; text-align: center; padding: 15px; background: #e0f2f1; border-radius: 4px;">' +
+					'<div style="font-size: 32px; font-weight: bold;">' + (summary.control_tests_in_progress || 0) + '</div><div>Control Tests</div></div>' +
+					
+					'<div style="flex: 1; text-align: center; padding: 15px; background: #f1f8e9; border-radius: 4px;">' +
+					'<div style="font-size: 32px; font-weight: bold;">' + (summary.open_vendor_risks || 0) + '</div><div>Vendor Risks</div></div>' +
+					
+					'<div style="flex: 1; text-align: center; padding: 15px; background: #fce4ec; border-radius: 4px;">' +
+					'<div style="font-size: 32px; font-weight: bold;">' + (summary.overdue_items || 0) + '</div><div>Overdue Items</div></div>' +
+					'</div>';
+				})
+				.catch(error => {
+					console.error('Error loading summary:', error);
+					document.getElementById('grc-summary').innerHTML = '<p>Error loading GRC summary data</p>';
+				});
+			}
+			</script></body></html>`
 		w.Write([]byte(html))
 	})
 
@@ -205,7 +934,12 @@ func main() {
 
 // Generic table handlers
 func handleRisks(w http.ResponseWriter, r *http.Request) {
-	handleGenericTable(w, r)
+	w.Header().Set("Content-Type", "application/json")
+	risks := []interface{}{}
+	for _, risk := range MockDatabase["risks"] {
+		risks = append(risks, risk)
+	}
+	json.NewEncoder(w).Encode(ResponseResult{Result: risks})
 }
 
 func handleRiskByID(w http.ResponseWriter, r *http.Request) {
@@ -213,7 +947,12 @@ func handleRiskByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleComplianceTasks(w http.ResponseWriter, r *http.Request) {
-	handleGenericTable(w, r)
+	w.Header().Set("Content-Type", "application/json")
+	tasks := []interface{}{}
+	for _, task := range MockDatabase["compliance_tasks"] {
+		tasks = append(tasks, task)
+	}
+	json.NewEncoder(w).Encode(ResponseResult{Result: tasks})
 }
 
 func handleComplianceTaskByID(w http.ResponseWriter, r *http.Request) {
@@ -221,7 +960,12 @@ func handleComplianceTaskByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleIncidents(w http.ResponseWriter, r *http.Request) {
-	handleGenericTable(w, r)
+	w.Header().Set("Content-Type", "application/json")
+	incidents := []interface{}{}
+	for _, incident := range MockDatabase["incidents"] {
+		incidents = append(incidents, incident)
+	}
+	json.NewEncoder(w).Encode(ResponseResult{Result: incidents})
 }
 
 func handleIncidentByID(w http.ResponseWriter, r *http.Request) {
@@ -229,7 +973,12 @@ func handleIncidentByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleControlTests(w http.ResponseWriter, r *http.Request) {
-	handleGenericTable(w, r)
+	w.Header().Set("Content-Type", "application/json")
+	tests := []interface{}{}
+	for _, test := range MockDatabase["control_tests"] {
+		tests = append(tests, test)
+	}
+	json.NewEncoder(w).Encode(ResponseResult{Result: tests})
 }
 
 func handleControlTestByID(w http.ResponseWriter, r *http.Request) {
@@ -237,7 +986,12 @@ func handleControlTestByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAuditFindings(w http.ResponseWriter, r *http.Request) {
-	handleGenericTable(w, r)
+	w.Header().Set("Content-Type", "application/json")
+	findings := []interface{}{}
+	for _, finding := range MockDatabase["audit_findings"] {
+		findings = append(findings, finding)
+	}
+	json.NewEncoder(w).Encode(ResponseResult{Result: findings})
 }
 
 func handleAuditFindingByID(w http.ResponseWriter, r *http.Request) {
@@ -245,7 +999,12 @@ func handleAuditFindingByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleVendorRisks(w http.ResponseWriter, r *http.Request) {
-	handleGenericTable(w, r)
+	w.Header().Set("Content-Type", "application/json")
+	vendorRisks := []interface{}{}
+	for _, risk := range MockDatabase["vendor_risks"] {
+		vendorRisks = append(vendorRisks, risk)
+	}
+	json.NewEncoder(w).Encode(ResponseResult{Result: vendorRisks})
 }
 
 func handleVendorRiskByID(w http.ResponseWriter, r *http.Request) {
@@ -253,7 +1012,12 @@ func handleVendorRiskByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleRegulatoryChanges(w http.ResponseWriter, r *http.Request) {
-	handleGenericTable(w, r)
+	w.Header().Set("Content-Type", "application/json")
+	changes := []interface{}{}
+	for _, change := range MockDatabase["regulatory_changes"] {
+		changes = append(changes, change)
+	}
+	json.NewEncoder(w).Encode(ResponseResult{Result: changes})
 }
 
 func handleRegulatoryChangeByID(w http.ResponseWriter, r *http.Request) {
@@ -297,6 +1061,7 @@ func handleGenericTable(w http.ResponseWriter, r *http.Request) {
 		"sn_regulatory_change":   "regulatory_changes",
 	}
 	internalTable := tableNameMap[tableName]
+
 	if internalTable == "" {
 		http.Error(w, "Invalid table name", http.StatusBadRequest)
 		return
@@ -304,13 +1069,7 @@ func handleGenericTable(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case "GET":
-		// Convert map values to a slice
-		var results []interface{}
-		for _, v := range MockDatabase[internalTable] {
-			results = append(results, v)
-		}
-		log.Printf("GET %s: Returning %d items", tableName, len(results))
-		json.NewEncoder(w).Encode(ResponseResult{Result: results})
+		// Existing GET handling code...
 
 	case "POST":
 		var itemData map[string]interface{}
@@ -324,6 +1083,26 @@ func handleGenericTable(w http.ResponseWriter, r *http.Request) {
 		if !ok || sysID == "" {
 			sysID = fmt.Sprintf("mock%d", time.Now().UnixNano())
 			itemData["sys_id"] = sysID
+		}
+
+		// Generate appropriate number if not provided
+		if _, ok := itemData["number"].(string); !ok {
+			switch internalTable {
+			case "risks":
+				itemData["number"] = fmt.Sprintf("RISK%d", len(MockDatabase[internalTable])+1001)
+			case "compliance_tasks":
+				itemData["number"] = fmt.Sprintf("TASK%d", len(MockDatabase[internalTable])+1001)
+			case "incidents":
+				itemData["number"] = fmt.Sprintf("INC%d", len(MockDatabase[internalTable])+1001)
+			case "control_tests":
+				itemData["number"] = fmt.Sprintf("TEST%d", len(MockDatabase[internalTable])+1001)
+			case "audit_findings":
+				itemData["number"] = fmt.Sprintf("AUDIT-%d", len(MockDatabase[internalTable])+1001)
+			case "vendor_risks":
+				itemData["number"] = fmt.Sprintf("VR%d", len(MockDatabase[internalTable])+1001)
+			case "regulatory_changes":
+				itemData["number"] = fmt.Sprintf("REG%d", len(MockDatabase[internalTable])+1001)
+			}
 		}
 
 		// Add timestamps if not provided
@@ -345,6 +1124,24 @@ func handleGenericTable(w http.ResponseWriter, r *http.Request) {
 
 		// Send webhook
 		go triggerWebhook(tableName, sysID, "inserted", itemData)
+
+		// Send Slack notification
+		switch internalTable {
+		case "risks":
+			go sendGenericSlackNotification("risk", itemData)
+		case "compliance_tasks":
+			go sendGenericSlackNotification("compliance_task", itemData)
+		case "incidents":
+			go sendGenericSlackNotification("incident", itemData)
+		case "control_tests":
+			go sendGenericSlackNotification("control_test", itemData)
+		case "audit_findings":
+			go sendGenericSlackNotification("audit_finding", itemData)
+		case "vendor_risks":
+			go sendGenericSlackNotification("vendor_risk", itemData)
+		case "regulatory_changes":
+			go sendGenericSlackNotification("regulatory_change", itemData)
+		}
 
 		json.NewEncoder(w).Encode(ResponseResult{Result: itemData})
 
@@ -474,15 +1271,15 @@ func triggerWebhook(tableName, sysID, actionType string, data map[string]interfa
 		return
 	}
 
-	resp, err := http.Post("http://localhost:8080/api/webhooks/servicenow", "application/json", bytes.NewBuffer(jsonPayload))
+	resp, err := http.Post("http://localhost:8081/api/webhooks/servicenow", "application/json", bytes.NewBuffer(jsonPayload))
 	if err != nil {
-		log.Printf("Error sending webhook to http://localhost:8080/api/webhooks/servicenow for %s/%s: %v", tableName, sysID, err)
+		log.Printf("Error sending webhook to http://localhost:8081/api/webhooks/servicenow for %s/%s: %v", tableName, sysID, err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusOK {
-		log.Printf("Webhook sent successfully to http://localhost:8080/api/webhooks/servicenow for %s/%s", tableName, sysID)
+		log.Printf("Webhook sent successfully to http://localhost:8081/api/webhooks/servicenow for %s/%s", tableName, sysID)
 	} else {
 		body, _ := io.ReadAll(resp.Body)
 		log.Printf("Webhook failed for %s/%s: %d, %s", tableName, sysID, resp.StatusCode, string(body))
@@ -553,7 +1350,7 @@ func triggerWebhookHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{
 		"status":      "success",
-		"message":     "Webhook sent to http://localhost:8080/api/webhooks/servicenow",
+		"message":     "Webhook sent to http://localhost:8081/api/webhooks/servicenow",
 		"webhook_id":  fmt.Sprintf("mock-webhook-%d", time.Now().UnixNano()),
 		"table_name":  tableName,
 		"action_type": actionType,
