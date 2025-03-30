@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -60,8 +61,14 @@ var MockDatabase = struct {
 	Threads:  make(map[string][]SlackMessage),
 	Channels: map[string]string{
 		"C12345": "general",
-		"C67890": "grc-alerts",
+		"C67890": "risk-management",
 		"C54321": "audit",
+		"C11111": "compliance-team",
+		"C22222": "incident-response",
+		"C33333": "vendor-risk",
+		"C44444": "regulatory-updates",
+		"C55555": "grc-reports",
+		"C66666": "control-testing",
 	},
 	Users: map[string]string{
 		"U12345": "john.doe",
@@ -101,6 +108,14 @@ func main() {
 	r.HandleFunc("/trigger_command", triggerCommand).Methods("POST")
 	r.HandleFunc("/trigger_interaction", triggerInteraction).Methods("POST")
 
+	r.HandleFunc("/test_servicenow_integration", testServiceNowIntegration).Methods("POST")
+	// Add this to your main() function
+	r.HandleFunc("/test_connectivity", func(w http.ResponseWriter, r *http.Request) {
+		log.Println("[MOCK SLACK] Received connectivity test")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"ok","message":"Slack mock server is running"}`))
+	}).Methods("GET")
+
 	// Health check and UI
 	r.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -120,6 +135,18 @@ func main() {
 func handlePostMessage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
+	requestBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("[MOCK SLACK] ERROR reading request body: %v", err)
+		http.Error(w, "Error reading request body", http.StatusBadRequest)
+		return
+	}
+	// Log the raw request body for debugging
+	log.Printf("[MOCK SLACK] Received POST message request body: %s", string(requestBody))
+
+	// Replace the consumed body with a new reader to use in the handler
+	r.Body = io.NopCloser(bytes.NewBuffer(requestBody))
+
 	// Parse the request
 	var channelID, text, threadTS string
 	var blocks []interface{}
@@ -128,6 +155,7 @@ func handlePostMessage(w http.ResponseWriter, r *http.Request) {
 	if strings.Contains(contentType, "application/json") {
 		var messageData map[string]interface{}
 		if err := json.NewDecoder(r.Body).Decode(&messageData); err != nil {
+			log.Printf("[MOCK SLACK] ERROR decoding JSON body: %v", err)
 			http.Error(w, "Invalid JSON body", http.StatusBadRequest)
 			return
 		}
@@ -146,6 +174,7 @@ func handlePostMessage(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		if err := r.ParseForm(); err != nil {
+			log.Printf("[MOCK SLACK] ERROR parsing form data: %v", err)
 			http.Error(w, "Invalid form data", http.StatusBadRequest)
 			return
 		}
@@ -164,6 +193,7 @@ func handlePostMessage(w http.ResponseWriter, r *http.Request) {
 
 	// Validate required fields
 	if channelID == "" {
+		log.Printf("[MOCK SLACK] ERROR: Missing required field: channel")
 		http.Error(w, "Missing required field: channel", http.StatusBadRequest)
 		return
 	}
@@ -194,10 +224,14 @@ func handlePostMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check for ServiceNow ID in the text to create mappings
-	if strings.Contains(text, "AUDIT-") || strings.Contains(text, "RISK-") {
+	if strings.Contains(text, "AUDIT-") || strings.Contains(text, "RISK-") ||
+		strings.Contains(text, "INC") || strings.Contains(text, "VR") ||
+		strings.Contains(text, "REG") || strings.Contains(text, "TEST") {
 		// This is simplified - in reality you'd need more sophisticated parsing
 		for _, word := range strings.Fields(text) {
-			if strings.HasPrefix(word, "AUDIT-") || strings.HasPrefix(word, "RISK-") {
+			if strings.HasPrefix(word, "AUDIT-") || strings.HasPrefix(word, "RISK") ||
+				strings.HasPrefix(word, "INC") || strings.HasPrefix(word, "VR") ||
+				strings.HasPrefix(word, "REG") || strings.HasPrefix(word, "TEST") {
 				ServiceNowSlackMapping[word] = messageTS
 				break
 			}
@@ -208,7 +242,7 @@ func handlePostMessage(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[MOCK SLACK] Message posted to %s: %s (ts: %s)\n", channelID, text, messageTS)
 
 	// Return success
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	responseData := map[string]interface{}{
 		"ok":      true,
 		"channel": channelID,
 		"ts":      messageTS,
@@ -218,7 +252,17 @@ func handlePostMessage(w http.ResponseWriter, r *http.Request) {
 			"bot_id": "B12345",
 			"ts":     messageTS,
 		},
-	})
+	}
+
+	responseJSON, err := json.Marshal(responseData)
+	if err != nil {
+		log.Printf("[MOCK SLACK] ERROR marshaling response: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[MOCK SLACK] Returning response: %s", string(responseJSON))
+	w.Write(responseJSON)
 }
 
 func handleUpdateMessage(w http.ResponseWriter, r *http.Request) {
@@ -703,12 +747,41 @@ func handleReceiveCommand(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[MOCK SLACK] Received slash command: %s %s from user %s in channel %s\n",
 		command, text, userID, channelID)
 
+	// Forward the command to the main application server
+	formData := url.Values{
+		"command":      {command},
+		"text":         {text},
+		"user_id":      {userID},
+		"channel_id":   {channelID},
+		"team_id":      {"T12345"},
+		"team_domain":  {"mockteam"},
+		"response_url": {"http://localhost:3002/mock_response"},
+		"trigger_id":   {fmt.Sprintf("trigger.%d", time.Now().Unix())},
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.PostForm("http://localhost:8081/api/slack/commands", formData)
+	if err != nil {
+		log.Printf("[MOCK SLACK] Error forwarding command to main app: %v", err)
+		http.Error(w, "Error forwarding command", http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read the response from the main app
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("[MOCK SLACK] Error reading response from main app: %v", err)
+		http.Error(w, "Error reading response", http.StatusInternalServerError)
+		return
+	}
+
+	// Log the response
+	log.Printf("[MOCK SLACK] Main app response to command: %s", string(responseBody))
+
 	// Return an immediate response
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"response_type": "ephemeral",
-		"text":          "Your command is being processed...",
-	})
+	w.Write(responseBody)
 }
 
 func handleReceiveInteraction(w http.ResponseWriter, r *http.Request) {
@@ -734,72 +807,32 @@ func handleReceiveInteraction(w http.ResponseWriter, r *http.Request) {
 	// Log the interaction
 	log.Printf("[MOCK SLACK] Received interaction: %s\n", payloadStr)
 
-	// Extract basic information
-	interactionType, _ := payload["type"].(string)
-
-	// Handle different interaction types
-	switch interactionType {
-	case "block_actions":
-		// Extract action information
-		actions, ok := payload["actions"].([]interface{})
-		if !ok || len(actions) == 0 {
-			http.Error(w, "Invalid actions format", http.StatusBadRequest)
-			return
-		}
-
-		action, ok := actions[0].(map[string]interface{})
-		if !ok {
-			http.Error(w, "Invalid action format", http.StatusBadRequest)
-			return
-		}
-
-		actionID, _ := action["action_id"].(string)
-		actionValue, _ := action["value"].(string)
-
-		// Process based on action ID
-		switch actionID {
-		case "assign_finding":
-			// Generic response for assign finding action
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"response_type":    "in_channel",
-				"text":             fmt.Sprintf("Finding has been assigned to user (value: %s)", actionValue),
-				"replace_original": true,
-			})
-
-		case "resolve_finding":
-			// Generic response for resolve finding action
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"response_type":    "in_channel",
-				"text":             fmt.Sprintf("Finding has been resolved with reason: %s", actionValue),
-				"replace_original": true,
-			})
-
-		default:
-			// Generic response
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"response_type": "ephemeral",
-				"text":          fmt.Sprintf("Action '%s' with value '%s' received and being processed...", actionID, actionValue),
-			})
-		}
-
-	case "view_submission":
-		// Handle form submissions
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"response_action": "clear",
-		})
-
-	case "view_closed":
-		// Handle modal closing
-		// No response needed
-		w.WriteHeader(http.StatusOK)
-
-	default:
-		// Generic response for other interaction types
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"response_type": "ephemeral",
-			"text":          "Interaction received and being processed...",
-		})
+	// Forward the interaction to the main application server
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.PostForm("http://localhost:8081/api/slack/interactions", url.Values{
+		"payload": {payloadStr},
+	})
+	if err != nil {
+		log.Printf("[MOCK SLACK] Error forwarding interaction to main app: %v", err)
+		http.Error(w, "Error forwarding interaction", http.StatusInternalServerError)
+		return
 	}
+	defer resp.Body.Close()
+
+	// Read the response from the main app
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("[MOCK SLACK] Error reading response from main app: %v", err)
+		http.Error(w, "Error reading response", http.StatusInternalServerError)
+		return
+	}
+
+	// Log the response
+	log.Printf("[MOCK SLACK] Main app response to interaction: %s", string(responseBody))
+
+	// Return the response from the main app
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(responseBody)
 }
 
 func handleMockResponseURL(w http.ResponseWriter, r *http.Request) {
@@ -848,7 +881,7 @@ func triggerCommand(w http.ResponseWriter, r *http.Request) {
 	}
 
 	userName := "unknown-user"
-	if name, exists := MockDatabase.Users[requestData.UserName]; exists {
+	if name, exists := MockDatabase.Users[requestData.UserID]; exists {
 		userName = name
 	}
 
@@ -873,7 +906,7 @@ func triggerCommand(w http.ResponseWriter, r *http.Request) {
 	// Get the webhook URL from the request or use default
 	webhookURL := requestData.WebhookURL
 	if webhookURL == "" {
-		webhookURL = "http://localhost:8080/api/slack/commands"
+		webhookURL = "http://localhost:8081/api/slack/commands"
 	}
 
 	// Send the webhook as form data (as Slack does)
@@ -902,6 +935,36 @@ func triggerCommand(w http.ResponseWriter, r *http.Request) {
 		"response":   string(respBody),
 		"webhook_id": fmt.Sprintf("mock-slack-command-%d", time.Now().UnixNano()),
 	})
+}
+
+func testServiceNowIntegration(w http.ResponseWriter, r *http.Request) {
+	// Forward the request to ServiceNow
+	client := &http.Client{Timeout: 10 * time.Second}
+	jsonData, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Error reading request body", http.StatusInternalServerError)
+		return
+	}
+
+	// Forward the exact request body to ServiceNow
+	resp, err := client.Post("http://localhost:3000/servicenow/create_risk",
+		"application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error forwarding to ServiceNow: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read the response from ServiceNow
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, "Error reading ServiceNow response", http.StatusInternalServerError)
+		return
+	}
+
+	// Return ServiceNow's response to the client
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(respBody)
 }
 
 func triggerInteraction(w http.ResponseWriter, r *http.Request) {
@@ -1038,7 +1101,7 @@ func triggerInteraction(w http.ResponseWriter, r *http.Request) {
 	// Get the webhook URL from the request or use default
 	webhookURL := requestData.WebhookURL
 	if webhookURL == "" {
-		webhookURL = "http://localhost:8080/api/slack/interactions"
+		webhookURL = "http://localhost:8081/api/slack/interactions"
 	}
 
 	// Send the webhook
@@ -1077,255 +1140,583 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
         <head>
             <title>Mock Slack Server</title>
             <style>
-                body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }
-                h1, h2, h3 { color: #4a154b; }
-                .section { margin: 20px 0; padding: 15px; background: #f5f5f5; border-radius: 5px; }
-                .endpoint { margin: 15px 0; padding: 15px; background: #fff; border: 1px solid #ddd; border-radius: 4px; }
-                .btn { display: inline-block; padding: 8px 16px; background: #4a154b; color: white; 
-                       text-decoration: none; border-radius: 4px; margin-right: 10px; border: none; cursor: pointer; }
-                .btn:hover { background: #611f69; }
-                input, select, textarea { padding: 8px; margin: 5px 0; width: 100%; box-sizing: border-box; border: 1px solid #ddd; border-radius: 4px; }
-                textarea { height: 100px; font-family: monospace; }
-                label { font-weight: bold; }
-                .form-group { margin-bottom: 10px; }
-                .response-area { background: #f9f9f9; border: 1px solid #ddd; padding: 10px; border-radius: 4px; margin-top: 15px; display: none; }
-                .header { display: flex; justify-content: space-between; align-items: center; }
-                .status { padding: 5px 10px; border-radius: 10px; font-size: 12px; font-weight: bold; }
-                .status.online { background: #2eb886; color: white; }
+                body { font-family: Arial, sans-serif; margin: 0; padding: 0; }
+                .app-container { display: flex; height: 100vh; }
+                .sidebar { width: 220px; background: #4a154b; color: white; padding: 10px 0; overflow-y: auto; }
+                .sidebar h3 { padding: 0 15px; margin-bottom: 10px; font-size: 16px; }
+                .channel-list { list-style: none; padding: 0; margin: 0; }
+                .channel-list li { padding: 5px 15px; cursor: pointer; }
+                .channel-list li:hover { background: #611f69; }
+                .channel-list li.active { background: #1164a3; font-weight: bold; }
+                .content { flex: 1; display: flex; flex-direction: column; }
+                .channel-header { padding: 10px 20px; border-bottom: 1px solid #ddd; display: flex; justify-content: space-between; align-items: center; }
+                .message-area { flex: 1; padding: 20px; overflow-y: auto; background: #f8f8f8; }
+                .message-composer { padding: 15px; border-top: 1px solid #ddd; display: flex; }
+                .message-composer input { flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 4px; margin-right: 10px; }
+                .message-composer button { background: #007a5a; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; }
+                .message { margin-bottom: 15px; display: flex; }
+                .message .avatar { width: 36px; height: 36px; background: #ddd; border-radius: 3px; margin-right: 10px; }
+                .message .message-content { flex: 1; }
+                .message .header { margin-bottom: 5px; }
+                .message .sender { font-weight: bold; margin-right: 8px; }
+                .message .time { color: #616061; font-size: 12px; }
+                .message .body { line-height: 1.46; }
+                .message .buttons { margin-top: 8px; display: flex; gap: 5px; }
+                .message .button { padding: 5px 10px; background: #fff; border: 1px solid #ddd; border-radius: 4px; cursor: pointer; font-size: 13px; }
+                .message .button:hover { background: #f8f8f8; }
+                .message .button.primary { background: #1264a3; color: white; border-color: #1264a3; }
+                .message .button.primary:hover { background: #0b5394; }
+                .message .button.danger { background: #e01e5a; color: white; border-color: #e01e5a; }
+                .message .button.danger:hover { background: #c41e56; }
+                .interactions { margin-top: 30px; padding: 20px; border-top: 1px solid #ddd; }
+                .command-input { display: flex; margin-bottom: 20px; }
+                .command-input input { flex: 1; padding: 8px; border: 1px solid #ddd; border-radius: 4px 0 0 4px; }
+                .command-input button { background: #007a5a; color: white; border: none; padding: 8px 15px; border-radius: 0 4px 4px 0; cursor: pointer; }
+                .response { background: #f8f8f8; padding: 10px; border-radius: 4px; margin-top: 10px; display: none; }
+                .notification { position: fixed; bottom: 20px; right: 20px; background: #007a5a; color: white; padding: 15px; border-radius: 4px; display: none; }
+                .risk-high { border-left: 4px solid #e01e5a; padding-left: 10px; }
+                .risk-medium { border-left: 4px solid #ecb22e; padding-left: 10px; }
+                .risk-low { border-left: 4px solid #2eb67d; padding-left: 10px; }
+                .tabs { display: flex; border-bottom: 1px solid #ddd; }
+                .tab { padding: 10px 15px; cursor: pointer; }
+                .tab.active { border-bottom: 2px solid #1264a3; font-weight: bold; }
+                .tab-content { display: none; padding: 15px; }
+                .tab-content.active { display: block; }
+                #slack-commands { list-style: none; padding: 0; }
+                #slack-commands li { margin-bottom: 5px; }
+                .reload-button { background: #007a5a; color: white; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer; }
+                .timestamp { color: #616061; font-size: 12px; margin-bottom: 10px; }
             </style>
         </head>
         <body>
-            <div class="header">
-                <h1>Mock Slack Server</h1>
-                <span class="status online">Online - Port 3002</span>
+            <div class="app-container">
+                <div class="sidebar">
+                    <h3>Channels</h3>
+                    <ul class="channel-list" id="channel-list">
+                        <li data-channel="C12345" class="active"># general</li>
+                        <li data-channel="C67890"># risk-management</li>
+                        <li data-channel="C54321"># audit</li>
+                        <li data-channel="C11111"># compliance-team</li>
+                        <li data-channel="C22222"># incident-response</li>
+                        <li data-channel="C33333"># vendor-risk</li>
+                        <li data-channel="C44444"># regulatory-updates</li>
+                        <li data-channel="C55555"># grc-reports</li>
+                        <li data-channel="C66666"># control-testing</li>
+                    </ul>
+                </div>
+                <div class="content">
+                    <div class="channel-header">
+                        <h2 id="current-channel"># general</h2>
+                        <button class="reload-button" id="reload-messages">Reload Messages</button>
+                    </div>
+                    <div class="message-area" id="message-area">
+                        <div class="timestamp">Today</div>
+                        <!-- Messages will be displayed here -->
+                    </div>
+                    
+                    <div class="interactions">
+                        <div class="tabs">
+                            <div class="tab active" data-tab="command-tab">Slash Commands</div>
+                            <div class="tab" data-tab="interaction-tab">Button Actions</div>
+                            <div class="tab" data-tab="integration-tab">ServiceNow Integration</div>
+                        </div>
+                        
+                        <div class="tab-content active" id="command-tab">
+                            <h3>Send Slash Command</h3>
+                            <div class="command-input">
+                                <input type="text" id="slash-command" placeholder="/grc-status" value="/grc-status">
+                                <button id="send-command">Send Command</button>
+                            </div>
+                            <div class="response" id="command-response"></div>
+                            
+                            <h4>Available Commands</h4>
+                            <ul id="slack-commands">
+                                <li><strong>/grc-status</strong> - Get current GRC status overview</li>
+                                <li><strong>/upload-evidence</strong> TASK_ID URL - Upload evidence for compliance task</li>
+                                <li><strong>/incident-update</strong> INC_ID details - Update an incident</li>
+                                <li><strong>/resolve-incident</strong> INC_ID resolution - Resolve an incident</li>
+                                <li><strong>/submit-test</strong> TEST_ID PASS|FAIL details - Submit test results</li>
+                                <li><strong>/resolve-finding</strong> AUDIT_ID resolution - Resolve an audit finding</li>
+                                <li><strong>/update-vendor</strong> VR_ID STATUS details - Update vendor status</li>
+                                <li><strong>/assess-impact</strong> REG_ID details - Add regulatory impact assessment</li>
+                                <li><strong>/plan-implementation</strong> REG_ID plan - Create implementation plan</li>
+                            </ul>
+                        </div>
+                        
+                        <div class="tab-content" id="interaction-tab">
+                            <h3>Send Button Click</h3>
+                            <form id="button-form">
+                                <div style="margin-bottom: 10px;">
+                                    <label>Action ID:</label>
+                                    <select id="action-id" style="width: 100%; padding: 5px;">
+                                        <option value="acknowledge_incident">acknowledge_incident</option>
+                                        <option value="resolve_incident">resolve_incident</option>
+                                        <option value="update_incident">update_incident</option>
+                                        <option value="assign_finding">assign_finding</option>
+                                        <option value="resolve_finding">resolve_finding</option>
+                                        <option value="discuss_risk">discuss_risk</option>
+                                        <option value="assign_risk">assign_risk</option>
+                                        <option value="request_compliance_report">request_compliance_report</option>
+                                        <option value="update_vendor_status">update_vendor_status</option>
+                                        <option value="add_impact_assessment">add_impact_assessment</option>
+                                        <option value="create_implementation_plan">create_implementation_plan</option>
+                                        <option value="submit_test_results">submit_test_results</option>
+                                    </select>
+                                </div>
+                                <div style="margin-bottom: 10px;">
+                                    <label>Value (item ID):</label>
+                                    <input type="text" id="action-value" style="width: 100%; padding: 5px;" placeholder="e.g., ack_incident_INC0001">
+                                </div>
+                                <div style="margin-bottom: 10px;">
+                                    <label>User:</label>
+                                    <select id="action-user" style="width: 100%; padding: 5px;">
+                                        <option value="U12345">john.doe</option>
+                                        <option value="U67890">jane.smith</option>
+                                    </select>
+                                </div>
+                                <button type="submit" style="background: #007a5a; color: white; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer;">
+                                    Send Interaction
+                                </button>
+                            </form>
+                            <div class="response" id="interaction-response"></div>
+                        </div>
+                        
+                        <div class="tab-content" id="integration-tab">
+                            <h3>Test ServiceNow Integration</h3>
+                            <form id="create-risk-form">
+                                <div style="margin-bottom: 10px;">
+                                    <label>Risk Title:</label>
+                                    <input type="text" id="risk-title" style="width: 100%; padding: 5px;" placeholder="e.g., Database vulnerability">
+                                </div>
+                                <div style="margin-bottom: 10px;">
+                                    <label>Description:</label>
+                                    <textarea id="risk-description" style="width: 100%; padding: 5px;" placeholder="Describe the risk..."></textarea>
+                                </div>
+                                <div style="margin-bottom: 10px;">
+                                    <label>Severity:</label>
+                                    <select id="risk-severity" style="width: 100%; padding: 5px;">
+                                        <option value="Critical">Critical</option>
+                                        <option value="High">High</option>
+                                        <option value="Medium">Medium</option>
+                                        <option value="Low">Low</option>
+                                    </select>
+                                </div>
+                                <div style="margin-bottom: 10px;">
+                                    <label>Category:</label>
+                                    <select id="risk-category" style="width: 100%; padding: 5px;">
+                                        <option value="Cybersecurity">Cybersecurity</option>
+                                        <option value="Financial">Financial</option>
+                                        <option value="Operational">Operational</option>
+                                        <option value="Compliance">Compliance</option>
+                                        <option value="Strategic">Strategic</option>
+                                    </select>
+                                </div>
+                                <button type="submit" style="background: #007a5a; color: white; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer;">
+                                    Create Risk in ServiceNow
+                                </button>
+                            </form>
+                            <div class="response" id="integration-response"></div>
+                        </div>
+                    </div>
+                </div>
             </div>
             
-            <div class="section">
-                <h2>Trigger Slack Commands</h2>
-                <div class="endpoint">
-                    <h3>Send Slash Command</h3>
-                    <form id="commandForm">
-                        <div class="form-group">
-                            <label>Command:</label>
-                            <input type="text" name="command" value="/grc">
-                        </div>
-                        <div class="form-group">
-                            <label>Text:</label>
-                            <input type="text" name="text" value="list findings">
-                        </div>
-                        <div class="form-group">
-                            <label>Channel:</label>
-                            <select name="channelID">
-                                <option value="C12345">general</option>
-                                <option value="C67890">grc-alerts</option>
-                                <option value="C54321">audit</option>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label>User:</label>
-                            <select name="userID">
-                                <option value="U12345">john.doe</option>
-                                <option value="U67890">jane.smith</option>
-                                <option value="U54321">audit.bot</option>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label>Webhook URL:</label>
-                            <input type="text" name="webhookURL" value="http://localhost:8080/api/slack/commands">
-                        </div>
-                        <button type="submit" class="btn">Send Command</button>
-                        <div class="response-area" id="commandResponse">
-                            <h4>Response:</h4>
-                            <pre id="commandResponseText"></pre>
-                        </div>
-                    </form>
-                </div>
-                
-                <div class="endpoint">
-                    <h3>Send Button Click Interaction</h3>
-                    <form id="buttonForm">
-                        <div class="form-group">
-                            <label>Action ID:</label>
-                            <input type="text" name="actionID" value="resolve_finding">
-                        </div>
-                        <div class="form-group">
-                            <label>Value:</label>
-                            <input type="text" name="value" value="AUDIT-123">
-                        </div>
-                        <div class="form-group">
-                            <label>Channel:</label>
-                            <select name="channelID">
-                                <option value="C12345">general</option>
-                                <option value="C67890">grc-alerts</option>
-                                <option value="C54321">audit</option>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label>User:</label>
-                            <select name="userID">
-                                <option value="U12345">john.doe</option>
-                                <option value="U67890">jane.smith</option>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label>Webhook URL:</label>
-                            <input type="text" name="webhookURL" value="http://localhost:8080/api/slack/interactions">
-                        </div>
-                        <button type="submit" class="btn">Send Interaction</button>
-                        <div class="response-area" id="buttonResponse">
-                            <h4>Response:</h4>
-                            <pre id="buttonResponseText"></pre>
-                        </div>
-                    </form>
-                </div>
-                
-                <div class="endpoint">
-                    <h3>Send Modal Submit Interaction</h3>
-                    <form id="modalForm">
-                        <div class="form-group">
-                            <label>Custom JSON Data (optional):</label>
-                            <textarea name="customData">{
-  "block1": {
-    "finding_input": {
-      "value": "This is a finding description"
-    }
-  }
-}</textarea>
-                        </div>
-                        <div class="form-group">
-                            <label>User:</label>
-                            <select name="userID">
-                                <option value="U12345">john.doe</option>
-                                <option value="U67890">jane.smith</option>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label>Webhook URL:</label>
-                            <input type="text" name="webhookURL" value="http://localhost:8080/api/slack/interactions">
-                        </div>
-                        <button type="submit" class="btn">Submit Modal</button>
-                        <div class="response-area" id="modalResponse">
-                            <h4>Response:</h4>
-                            <pre id="modalResponseText"></pre>
-                        </div>
-                    </form>
-                </div>
-            </div>
-            
-            <div class="section">
-                <h2>API Endpoints</h2>
-                <div class="endpoint">
-                    <p>Use these endpoints to test your Slack integration:</p>
-                    <ul>
-                        <li><strong>Post Message:</strong> http://localhost:3002/api/chat.postMessage</li>
-                        <li><strong>Update Message:</strong> http://localhost:3002/api/chat.update</li>
-                        <li><strong>Post Ephemeral:</strong> http://localhost:3002/api/chat.postEphemeral</li>
-                        <li><strong>Add Reaction:</strong> http://localhost:3002/api/reactions.add</li>
-                        <li><strong>List Channels:</strong> http://localhost:3002/api/conversations.list</li>
-                        <li><strong>Channel History:</strong> http://localhost:3002/api/conversations.history</li>
-                        <li><strong>List Users:</strong> http://localhost:3002/api/users.list</li>
-                        <li><strong>User Info:</strong> http://localhost:3002/api/users.info</li>
-                    </ul>
-                    <p>Webhook endpoints to implement in your application:</p>
-                    <ul>
-                        <li><strong>Slash Commands:</strong> http://localhost:8080/api/slack/commands</li>
-                        <li><strong>Interactions:</strong> http://localhost:8080/api/slack/interactions</li>
-                    </ul>
-                    <p>Mock triggers (to simulate Slack sending webhooks to your app):</p>
-                    <ul>
-                        <li><strong>Trigger Command:</strong> http://localhost:3002/trigger_command</li>
-                        <li><strong>Trigger Interaction:</strong> http://localhost:3002/trigger_interaction</li>
-                    </ul>
-                </div>
-            </div>
+            <div class="notification" id="notification">New message received!</div>
             
             <script>
-                // Helper function for form submission
-                function handleFormSubmit(formId, endpoint, responseAreaId, responseTextId) {
-                    document.getElementById(formId).addEventListener('submit', function(e) {
-                        e.preventDefault();
-                        const formData = new FormData(this);
-                        
-                        // Build the request data
-                        const requestData = {};
-                        for (const [key, value] of formData.entries()) {
-                            if (key === 'customData') {
-                                try {
-                                    requestData[key] = JSON.parse(value);
-                                } catch (err) {
-                                    alert('Invalid JSON in custom data field');
-                                    return;
-                                }
-                            } else {
-                                requestData[key] = value;
-                            }
-                        }
-                        
-                        // Send the request
-                        fetch(endpoint, {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                            },
-                            body: JSON.stringify(requestData)
-                        })
+                // Current channel state
+                let currentChannel = 'C12345';
+                
+                // Function to load messages for a channel
+                function loadMessages(channelId) {
+                    fetch('/api/conversations.history?channel=' + channelId)
                         .then(response => response.json())
                         .then(data => {
-                            // Show the response
-                            document.getElementById(responseAreaId).style.display = 'block';
-                            document.getElementById(responseTextId).textContent = JSON.stringify(data, null, 2);
+                            const messageArea = document.getElementById('message-area');
+                            messageArea.innerHTML = '<div class="timestamp">Today</div>';
+                            
+                            if (data.messages && data.messages.length > 0) {
+                                // Sort messages by timestamp (newest first)
+                                data.messages.sort((a, b) => parseFloat(b.ts) - parseFloat(a.ts));
+                                
+                                // Add messages to the DOM
+                                data.messages.forEach(msg => {
+                                    const messageElement = createMessageElement(msg);
+                                    messageArea.appendChild(messageElement);
+                                });
+                                
+                                // Check if this is an initial load or a refresh
+                                if (window.lastMessageTimestamp === undefined) {
+                                    // Initial load
+                                    if (data.messages.length > 0) {
+                                        window.lastMessageTimestamp = parseFloat(data.messages[0].ts);
+                                    }
+                                } else {
+                                    // Check for new messages
+                                    if (data.messages.length > 0 && parseFloat(data.messages[0].ts) > window.lastMessageTimestamp) {
+                                        showNotification('New message received!');
+                                        window.lastMessageTimestamp = parseFloat(data.messages[0].ts);
+                                    }
+                                }
+                            } else {
+                                messageArea.innerHTML += '<p>No messages in this channel yet.</p>';
+                            }
                         })
                         .catch(error => {
-                            document.getElementById(responseAreaId).style.display = 'block';
-                            document.getElementById(responseTextId).textContent = 'Error: ' + error.message;
+                            console.error('Error loading messages:', error);
+                            document.getElementById('message-area').innerHTML = 
+                                '<div class="timestamp">Today</div><p>Error loading messages. Please try again.</p>';
                         });
-                    });
                 }
                 
-                // Set up form handlers
-                handleFormSubmit('commandForm', '/trigger_command', 'commandResponse', 'commandResponseText');
-                handleFormSubmit('buttonForm', '/trigger_interaction', 'buttonResponse', 'buttonResponseText');
-                
-                // Special handling for modal form
-                document.getElementById('modalForm').addEventListener('submit', function(e) {
-                    e.preventDefault();
-                    const formData = new FormData(this);
+                // Function to create a message element
+                function createMessageElement(msg) {
+                    const message = document.createElement('div');
+                    message.className = 'message';
                     
-                    const requestData = {
-                        type: 'view_submission',
-                        userID: formData.get('userID'),
-                        webhookURL: formData.get('webhookURL')
-                    };
-                    
-                    // Parse custom data if provided
-                    try {
-                        const customDataStr = formData.get('customData');
-                        if (customDataStr && customDataStr.trim() !== '') {
-                            requestData.customData = JSON.parse(customDataStr);
-                        }
-                    } catch (err) {
-                        alert('Invalid JSON in custom data field');
-                        return;
+                    // Check for risk severity in message text and add appropriate class
+                    if (msg.text.includes('High-Severity Risk') || msg.text.includes('Critical')) {
+                        message.classList.add('risk-high');
+                    } else if (msg.text.includes('Medium-Severity Risk')) {
+                        message.classList.add('risk-medium');
+                    } else if (msg.text.includes('Low-Severity Risk')) {
+                        message.classList.add('risk-low');
                     }
                     
-                    // Send the request
-                    fetch('/trigger_interaction', {
+                    // Create avatar
+                    const avatar = document.createElement('div');
+                    avatar.className = 'avatar';
+                    message.appendChild(avatar);
+                    
+                    // Create message content container
+                    const content = document.createElement('div');
+                    content.className = 'message-content';
+                    
+                    // Create header with sender and time
+                    const header = document.createElement('div');
+                    header.className = 'header';
+                    
+                    const sender = document.createElement('span');
+                    sender.className = 'sender';
+                    sender.textContent = msg.user ? 'User' : 'GRC Bot';
+                    header.appendChild(sender);
+                    
+                    const time = document.createElement('span');
+                    time.className = 'time';
+                    const date = new Date(parseFloat(msg.ts) * 1000);
+                    time.textContent = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                    header.appendChild(time);
+                    
+                    content.appendChild(header);
+                    
+                    // Create message body
+                    const body = document.createElement('div');
+                    body.className = 'body';
+                    body.textContent = msg.text;
+                    content.appendChild(body);
+                    
+                    // Create buttons if this is a risk or incident message
+                    if (msg.blocks && msg.blocks.some(block => block.type === 'actions')) {
+                        const buttonsContainer = document.createElement('div');
+                        buttonsContainer.className = 'buttons';
+                        
+                        // Check message content to determine appropriate buttons
+                        if (msg.text.includes('Risk')) {
+                            buttonsContainer.innerHTML = '' +
+                                '<button class="button" data-action="discuss_risk">Discuss Mitigation</button>' +
+                                '<button class="button" data-action="assign_risk">Assign Owner</button>' +
+                                '<button class="button" data-action="view_in_servicenow">View in ServiceNow</button>';
+                        } else if (msg.text.includes('Incident')) {
+                            buttonsContainer.innerHTML = '' +
+                                '<button class="button primary" data-action="acknowledge_incident">🚨 Acknowledge</button>' +
+                                '<button class="button" data-action="update_incident">📝 Add Update</button>' +
+                                '<button class="button danger" data-action="resolve_incident">✅ Resolve</button>';
+                        } else if (msg.text.includes('Finding')) {
+                            buttonsContainer.innerHTML = '' +
+                                '<button class="button" data-action="assign_finding">Assign Owner</button>' +
+                                '<button class="button" data-action="resolve_finding">Resolve Finding</button>' +
+                                '<button class="button" data-action="view_in_servicenow">View in ServiceNow</button>';
+                        } else if (msg.text.includes('Vendor')) {
+                            buttonsContainer.innerHTML = '' +
+                                '<button class="button" data-action="request_compliance_report">Request Report</button>' +
+                                '<button class="button" data-action="update_vendor_status">Update Status</button>' +
+                                '<button class="button" data-action="view_in_servicenow">View in ServiceNow</button>';
+                        } else if (msg.text.includes('Regulatory')) {
+                            buttonsContainer.innerHTML = '' +
+                                '<button class="button" data-action="add_impact_assessment">Add Impact Assessment</button>' +
+                                '<button class="button" data-action="create_implementation_plan">Create Implementation Plan</button>' +
+                                '<button class="button" data-action="view_in_servicenow">View in ServiceNow</button>';
+                        } else if (msg.text.includes('Test')) {
+                            buttonsContainer.innerHTML = '' +
+                                '<button class="button" data-action="submit_test_results">Submit Results</button>' +
+                                '<button class="button" data-action="view_in_servicenow">View in ServiceNow</button>';
+                        }
+                    
+                        // Add button click handlers
+                        const buttons = buttonsContainer.querySelectorAll('.button');
+                        buttons.forEach(button => {
+                            button.addEventListener('click', function() {
+                                const actionId = this.getAttribute('data-action');
+                                if (actionId === 'view_in_servicenow') {
+                                    alert('This would open ServiceNow in a real implementation');
+                                    return;
+                                }
+                                
+                                // Extract item ID from the message text
+                                let itemId = '';
+                                const messageText = msg.text;
+                                
+                                // Try to find a standard ID pattern
+                                const idMatches = messageText.match(/(RISK\d+|AUDIT-\d+|INC\d+|TEST\d+|VR\d+|REG\d+)/);
+                                if (idMatches && idMatches[1]) {
+                                    itemId = idMatches[1];
+                                }
+                                
+                                // Format the value based on the action
+                                let actionValue = actionId + '_' + itemId;
+                                
+                                // Populate the interaction form
+                                document.getElementById('action-id').value = actionId;
+                                document.getElementById('action-value').value = actionValue;
+                                
+                                // Switch to interaction tab
+                                const tabs = document.querySelectorAll('.tab');
+                                tabs.forEach(tab => tab.classList.remove('active'));
+                                document.querySelector('.tab[data-tab="interaction-tab"]').classList.add('active');
+                                
+                                const tabContents = document.querySelectorAll('.tab-content');
+                                tabContents.forEach(content => content.classList.remove('active'));
+                                document.getElementById('interaction-tab').classList.add('active');
+                                
+                                // Scroll to the form
+                                document.getElementById('button-form').scrollIntoView({ behavior: 'smooth' });
+                            });
+                        });
+                        
+                        content.appendChild(buttonsContainer);
+                    }
+                    
+                    message.appendChild(content);
+                    return message;
+                }
+                
+                // Function to send a slash command
+                function sendCommand(command) {
+                    // First, create a loading indicator
+                    const responseArea = document.getElementById('command-response');
+                    responseArea.style.display = 'block';
+                    responseArea.innerHTML = 'Sending command...';
+                    
+                    // Split the command into parts
+                    let parts = command.split(' ');
+                    let commandName = parts[0];
+                    let commandArgs = parts.slice(1).join(' ');
+                    
+                    // Send the request to our trigger endpoint
+                    fetch('/trigger_command', {
                         method: 'POST',
                         headers: {
-                            'Content-Type': 'application/json',
+                            'Content-Type': 'application/json'
                         },
-                        body: JSON.stringify(requestData)
+                        body: JSON.stringify({
+                            command: commandName,
+                            text: commandArgs,
+                            user_id: 'U12345',  // Default user
+                            channel_id: currentChannel
+                        })
                     })
                     .then(response => response.json())
                     .then(data => {
-                        // Show the response
-                        document.getElementById('modalResponse').style.display = 'block';
-                        document.getElementById('modalResponseText').textContent = JSON.stringify(data, null, 2);
+                        // Display the response
+                        responseArea.innerHTML = '<strong>Command sent:</strong> ' + command + 
+                                               '<br><strong>Response:</strong> ' + data.response;
+                        
+                        // Show notification
+                        showNotification('Command sent: ' + command);
+                        
+                        // Reload messages to show any updates
+                        setTimeout(() => loadMessages(currentChannel), 1000);
                     })
                     .catch(error => {
-                        document.getElementById('modalResponse').style.display = 'block';
-                        document.getElementById('modalResponseText').textContent = 'Error: ' + error.message;
+                        console.error('Error sending command:', error);
+                        responseArea.innerHTML = 'Error sending command: ' + error.message;
                     });
+                }
+                
+                // Function to send a button interaction
+                function sendInteraction(actionId, actionValue, userId) {
+                    // First, create a loading indicator
+                    const responseArea = document.getElementById('interaction-response');
+                    responseArea.style.display = 'block';
+                    responseArea.innerHTML = 'Sending interaction...';
+                    
+                    // Send the request to our trigger endpoint
+                    fetch('/trigger_interaction', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            type: 'block_actions',
+                            action_id: actionId,
+                            value: actionValue,
+                            user_id: userId,
+                            channel_id: currentChannel
+                        })
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        // Display the response
+                        responseArea.innerHTML = '<strong>Interaction sent:</strong> ' + actionId + ' (' + actionValue + ')' + 
+                                               '<br><strong>Response:</strong> ' + data.response;
+                        
+                        // Show notification
+                        showNotification('Interaction sent: ' + actionId);
+                        
+                        // Reload messages to show any updates
+                        setTimeout(() => loadMessages(currentChannel), 1000);
+                    })
+                    .catch(error => {
+                        console.error('Error sending interaction:', error);
+                        responseArea.innerHTML = 'Error sending interaction: ' + error.message;
+                    });
+                }
+                
+                // Function to show a notification
+                function showNotification(message) {
+                    const notification = document.getElementById('notification');
+                    notification.textContent = message;
+                    notification.style.display = 'block';
+                    
+                    setTimeout(() => {
+                        notification.style.display = 'none';
+                    }, 3000);
+                }
+                
+                // Set up event listeners
+                document.addEventListener('DOMContentLoaded', function() {
+                    // Load messages for the default channel
+                    loadMessages(currentChannel);
+                    
+                    // Channel switching
+                    const channelItems = document.querySelectorAll('.channel-list li');
+                    channelItems.forEach(item => {
+                        item.addEventListener('click', function() {
+                            // Update active state
+                            channelItems.forEach(i => i.classList.remove('active'));
+                            this.classList.add('active');
+                            
+                            // Update current channel and title
+                            currentChannel = this.getAttribute('data-channel');
+                            document.getElementById('current-channel').textContent = '# ' + this.textContent.trim().substring(2);
+                            
+                            // Load messages for the selected channel
+                            loadMessages(currentChannel);
+                        });
+                    });
+                    
+                    // Reload button
+                    document.getElementById('reload-messages').addEventListener('click', function() {
+                        loadMessages(currentChannel);
+                    });
+                    
+                    // Tab switching
+                    const tabs = document.querySelectorAll('.tab');
+                    tabs.forEach(tab => {
+                        tab.addEventListener('click', function() {
+                            // Update active tab
+                            tabs.forEach(t => t.classList.remove('active'));
+                            this.classList.add('active');
+                            
+                            // Update active content
+                            const tabId = this.getAttribute('data-tab');
+                            const tabContents = document.querySelectorAll('.tab-content');
+                            tabContents.forEach(content => content.classList.remove('active'));
+                            document.getElementById(tabId).classList.add('active');
+                        });
+                    });
+                    
+                    // Command form
+                    document.getElementById('send-command').addEventListener('click', function() {
+                        const command = document.getElementById('slash-command').value;
+                        if (command) {
+                            sendCommand(command);
+                        }
+                    });
+                    
+                    // Button interaction form
+                    document.getElementById('button-form').addEventListener('submit', function(e) {
+                        e.preventDefault();
+                        
+                        const actionId = document.getElementById('action-id').value;
+                        const actionValue = document.getElementById('action-value').value;
+                        const userId = document.getElementById('action-user').value;
+                        
+                        if (actionId && actionValue) {
+                            sendInteraction(actionId, actionValue, userId);
+                        }
+                    });
+                    
+                    // ServiceNow integration form
+                    document.getElementById('create-risk-form').addEventListener('submit', function(e) {
+                        e.preventDefault();
+                        
+                        const title = document.getElementById('risk-title').value;
+                        const description = document.getElementById('risk-description').value;
+                        const severity = document.getElementById('risk-severity').value;
+                        const category = document.getElementById('risk-category').value;
+                        
+                        if (!title || !description) {
+                            alert('Please provide a title and description');
+                            return;
+                        }
+                        
+                        const responseArea = document.getElementById('integration-response');
+                        responseArea.style.display = 'block';
+                        responseArea.innerHTML = 'Creating risk in ServiceNow...';
+                        
+                        // Send the request to create a risk in ServiceNow
+                        fetch('/test_servicenow_integration', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({
+                                title: title,
+                                description: description,
+                                severity: severity,
+                                category: category,
+                                owner: 'jane.smith'
+                            })
+                        })
+                        .then(response => response.json())
+                        .then(data => {
+                            // Display the response
+                            responseArea.innerHTML = '<strong>Risk created in ServiceNow:</strong><br>ID: ' + 
+                                                  (data.result.number || data.result.sys_id) + '<br>Title: ' + title;
+                            
+                            // Show notification
+                            showNotification('Risk created in ServiceNow');
+                            
+                            // Auto-switch to the risk-management channel
+                            const riskChannelEl = document.querySelector('.channel-list li[data-channel="C67890"]');
+                            if (riskChannelEl) {
+                                riskChannelEl.click();
+                            }
+                            
+                            // Wait a moment for the webhook to process, then reload messages
+                            setTimeout(() => loadMessages('C67890'), 2000);
+                        })
+                        .catch(error => {
+                            console.error('Error creating risk:', error);
+                            responseArea.innerHTML = 'Error creating risk: ' + error.message;
+                        });
+                    });
+                    
+                    // Auto-refresh messages every 3 seconds
+                    setInterval(() => {
+                        loadMessages(currentChannel);
+                    }, 3000);
                 });
             </script>
         </body>
