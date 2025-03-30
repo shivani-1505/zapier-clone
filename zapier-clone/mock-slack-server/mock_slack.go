@@ -80,6 +80,15 @@ var MockDatabase = struct {
 // ServiceNowSlackMapping maps ServiceNow IDs to Slack threads
 var ServiceNowSlackMapping = map[string]string{}
 
+func init() {
+	// Initialize empty maps
+	MockDatabase.Messages = make(map[string]SlackMessage)
+	MockDatabase.Threads = make(map[string][]SlackMessage)
+
+	// Keep the pre-defined channels and users
+	log.Println("[MOCK SLACK] Initializing clean message database")
+}
+
 func main() {
 	r := mux.NewRouter()
 
@@ -732,107 +741,93 @@ func handleUserInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleReceiveCommand(w http.ResponseWriter, r *http.Request) {
-	// This simulates your application's endpoint for receiving Slack slash commands
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "Invalid form data", http.StatusBadRequest)
 		return
 	}
 
+	// Log the command details more verbosely for debugging
 	command := r.FormValue("command")
 	text := r.FormValue("text")
-	userID := r.FormValue("user_id")
 	channelID := r.FormValue("channel_id")
+	userID := r.FormValue("user_id")
 
-	// Log the command
-	log.Printf("[MOCK SLACK] Received slash command: %s %s from user %s in channel %s\n",
+	log.Printf("[MOCK SLACK] Received command: %s with text: %s from user %s in channel %s",
 		command, text, userID, channelID)
 
-	// Forward the command to the main application server
-	formData := url.Values{
-		"command":      {command},
-		"text":         {text},
-		"user_id":      {userID},
-		"channel_id":   {channelID},
-		"team_id":      {"T12345"},
-		"team_domain":  {"mockteam"},
-		"response_url": {"http://localhost:3002/mock_response"},
-		"trigger_id":   {fmt.Sprintf("trigger.%d", time.Now().Unix())},
+	// Create a complete copy of the form values to forward
+	formValues := url.Values{}
+	for key, values := range r.Form {
+		formValues[key] = values
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.PostForm("http://localhost:8081/api/slack/commands", formData)
+	// Forward to ServiceNow with correctly formatted form data
+	client := &http.Client{Timeout: 10 * time.Second} // Increased timeout
+	resp, err := client.PostForm("http://localhost:3000/api/slack/commands", formValues)
 	if err != nil {
-		log.Printf("[MOCK SLACK] Error forwarding command to main app: %v", err)
-		http.Error(w, "Error forwarding command", http.StatusInternalServerError)
+		log.Printf("[MOCK SLACK] ERROR forwarding command to ServiceNow: %v", err)
+		http.Error(w, "Error forwarding command: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer resp.Body.Close()
 
-	// Read the response from the main app
-	responseBody, err := io.ReadAll(resp.Body)
+	// Read the response body
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Printf("[MOCK SLACK] Error reading response from main app: %v", err)
+		log.Printf("[MOCK SLACK] ERROR reading response from ServiceNow: %v", err)
 		http.Error(w, "Error reading response", http.StatusInternalServerError)
 		return
 	}
 
-	// Log the response
-	log.Printf("[MOCK SLACK] Main app response to command: %s", string(responseBody))
+	log.Printf("[MOCK SLACK] ServiceNow response: %s", string(respBody))
 
-	// Return an immediate response
+	// Return ServiceNow's response
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(responseBody)
+	w.Write(respBody)
+
+	// Check if this is an in_channel response
+	var response map[string]interface{}
+	if json.Unmarshal(respBody, &response) == nil {
+		if responseType, ok := response["response_type"].(string); ok && responseType == "in_channel" {
+			if respText, ok := response["text"].(string); ok {
+				// Post to channel
+				postMessageToChannel(channelID, respText)
+			}
+		}
+	}
 }
 
+// Replace handleReceiveInteraction with this enhanced version
 func handleReceiveInteraction(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "Invalid form data", http.StatusBadRequest)
-		return
-	}
-
+	r.ParseForm()
 	payloadStr := r.FormValue("payload")
-	if payloadStr == "" {
-		http.Error(w, "Missing payload", http.StatusBadRequest)
-		return
-	}
 
-	var payload map[string]interface{}
-	if err := json.Unmarshal([]byte(payloadStr), &payload); err != nil {
-		http.Error(w, "Invalid payload JSON", http.StatusBadRequest)
-		return
-	}
-
-	// Log the interaction
-	log.Printf("[MOCK SLACK] Received interaction: %s\n", payloadStr)
-
-	// Forward the interaction to the main application server
+	// Forward to ServiceNow
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.PostForm("http://localhost:8081/api/slack/interactions", url.Values{
+	resp, err := client.PostForm("http://localhost:3000/api/slack/interactions", url.Values{
 		"payload": {payloadStr},
 	})
 	if err != nil {
-		log.Printf("[MOCK SLACK] Error forwarding interaction to main app: %v", err)
 		http.Error(w, "Error forwarding interaction", http.StatusInternalServerError)
 		return
 	}
 	defer resp.Body.Close()
 
-	// Read the response from the main app
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("[MOCK SLACK] Error reading response from main app: %v", err)
-		http.Error(w, "Error reading response", http.StatusInternalServerError)
-		return
+	// Return ServiceNow's response
+	respBody, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(respBody)
+}
+
+// Add this helper function
+func postMessageToChannel(channelID, text string) {
+	messageData := map[string]interface{}{
+		"channel": channelID,
+		"text":    text,
 	}
 
-	// Log the response
-	log.Printf("[MOCK SLACK] Main app response to interaction: %s", string(responseBody))
-
-	// Return the response from the main app
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(responseBody)
+	jsonData, _ := json.Marshal(messageData)
+	http.Post("http://localhost:3002/api/chat.postMessage", "application/json", bytes.NewBuffer(jsonData))
 }
 
 func handleMockResponseURL(w http.ResponseWriter, r *http.Request) {
