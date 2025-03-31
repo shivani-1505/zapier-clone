@@ -560,6 +560,34 @@ func handleTransitions(w http.ResponseWriter, r *http.Request) {
 		case "51": // Any -> Resolved (and remove from ServiceNow)
 			ticket.Status = "Resolved"
 			ticket.Resolution = "Issue Resolved"
+            // Update ServiceNow status to Resolved
+			if ticket.Fields != nil {
+				if snID, ok := ticket.Fields["customfield_servicenow_id"]; ok {
+					if serviceNowID, ok := snID.(string); ok && serviceNowID != "" {
+						log.Printf("[JIRA MOCK] Updating ServiceNow ticket %s to Resolved", serviceNowID)
+
+						// Notify ServiceNow of the status change to Resolved
+						go notifyServiceNowOfStatusChange(serviceNowID, "Resolved", previousStatus)
+
+						// Optional: If still required, remove from ServiceNow after update
+						done := make(chan bool)
+						go func() {
+							removeFromServiceNow(serviceNowID)
+							done <- true
+						}()
+						select {
+						case <-done:
+							log.Printf("[JIRA MOCK] Successfully removed from ServiceNow after resolving %s", key)
+						case <-time.After(15 * time.Second):
+							log.Printf("[JIRA MOCK] Timeout waiting for ServiceNow removal for %s", key)
+						}
+					} else {
+						log.Printf("[JIRA MOCK] ServiceNow ID for issue %s is not a valid string or is empty", key)
+					}
+				} else {
+					log.Printf("[JIRA MOCK] No ServiceNow ID found for issue %s", key)
+				}
+			}
 		default:
 			http.Error(w, "Invalid transition ID", http.StatusBadRequest)
 			return
@@ -579,23 +607,11 @@ func handleTransitions(w http.ResponseWriter, r *http.Request) {
 			if snID, ok := ticket.Fields["customfield_servicenow_id"]; ok {
 				if strID, ok := snID.(string); ok && strID != "" {
 					serviceNowID = strID
-					
-					// If status is Resolved, remove from ServiceNow
+
+					// If status is Resolved, ensure ServiceNow is updated too
 					if ticket.Status == "Resolved" {
-						log.Printf("[JIRA MOCK] Issue %s marked as Resolved, removing from ServiceNow with ID: %s", key, serviceNowID)
-						// Use a channel to make sure the removal completes before continuing
-						done := make(chan bool)
-						go func() {
-							removeFromServiceNow(serviceNowID)
-							done <- true
-						}()
-						// Wait for removal to complete with a timeout
-						select {
-						case <-done:
-							log.Printf("[JIRA MOCK] Successfully processed ServiceNow removal for %s", key)
-						case <-time.After(15 * time.Second):
-							log.Printf("[JIRA MOCK] Timeout waiting for ServiceNow removal for %s", key)
-						}
+						log.Printf("[JIRA MOCK] Updating ServiceNow for issue %s to Resolved", key)
+						go notifyServiceNowOfStatusChange(serviceNowID, "Resolved", previousStatus)
 					} else if transitionID != "51" { // For other transitions, just notify status change
 						go notifyServiceNowOfStatusChange(serviceNowID, ticket.Status, previousStatus)
 					}
@@ -610,6 +626,7 @@ func handleTransitions(w http.ResponseWriter, r *http.Request) {
 		go triggerStatusChangeWebhook(key, ticket.Status, previousStatus)
 	}
 }
+
 
 func removeFromServiceNow(serviceNowID string) {
     if serviceNowID == "" {
