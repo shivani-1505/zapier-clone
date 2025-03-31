@@ -1315,18 +1315,32 @@ func triggerWebhook(tableName, sysID, actionType string, data map[string]interfa
 		return
 	}
 
-	resp, err := http.Post("http://localhost:8081/api/webhooks/servicenow", "application/json", bytes.NewBuffer(jsonPayload))
+	// Send to Jira
+	resp, err := http.Post("http://localhost:5000/api/webhooks/servicenow", "application/json", bytes.NewBuffer(jsonPayload))
 	if err != nil {
-		log.Printf("Error sending webhook to http://localhost:8081/api/webhooks/servicenow for %s/%s: %v", tableName, sysID, err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		log.Printf("Webhook sent successfully to http://localhost:8081/api/webhooks/servicenow for %s/%s", tableName, sysID)
+		log.Printf("Error sending webhook to Jira for %s/%s: %v", tableName, sysID, err)
 	} else {
-		body, _ := io.ReadAll(resp.Body)
-		log.Printf("Webhook failed for %s/%s: %d, %s", tableName, sysID, resp.StatusCode, string(body))
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			log.Printf("Webhook sent successfully to Jira for %s/%s", tableName, sysID)
+		} else {
+			body, _ := io.ReadAll(resp.Body)
+			log.Printf("Webhook to Jira failed for %s/%s: %d, %s", tableName, sysID, resp.StatusCode, string(body))
+		}
+	}
+
+	// Send to Slack integration server or other webhook receiver (if needed)
+	respSlack, err := http.Post("http://localhost:8081/api/webhooks/servicenow", "application/json", bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		log.Printf("Error sending webhook to integration server for %s/%s: %v", tableName, sysID, err)
+	} else {
+		defer respSlack.Body.Close()
+		if respSlack.StatusCode == http.StatusOK {
+			log.Printf("Webhook sent successfully to integration server for %s/%s", tableName, sysID)
+		} else {
+			body, _ := io.ReadAll(respSlack.Body)
+			log.Printf("Webhook to integration server failed for %s/%s: %d, %s", tableName, sysID, respSlack.StatusCode, string(body))
+		}
 	}
 }
 
