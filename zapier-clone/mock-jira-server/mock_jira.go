@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -55,19 +57,76 @@ type JiraWebhookPayload struct {
 	User         map[string]interface{} `json:"user,omitempty"`
 }
 
+// ServiceNowWebhookPayload represents a webhook payload sent by ServiceNow
+type ServiceNowWebhookPayload struct {
+	SysID      string                 `json:"sys_id"`
+	TableName  string                 `json:"table_name"`
+	ActionType string                 `json:"action_type"`
+	Data       map[string]interface{} `json:"data"`
+}
+
 // MockDatabase holds our mock Jira data
-var MockDatabase = map[string]interface{}{
-	"tickets": map[string]JiraTicket{},
-	"projects": map[string]interface{}{
+var MockDatabase = struct {
+	Tickets            map[string]JiraTicket
+	Projects           map[string]interface{}
+	ServiceNowJiraMap  map[string]string
+	WebhookLog         []map[string]interface{}
+	TicketCounters     map[string]int
+	AutoCreateMappings map[string]bool
+}{
+	Tickets:            make(map[string]JiraTicket),
+	Projects:           make(map[string]interface{}),
+	ServiceNowJiraMap:  make(map[string]string),
+	WebhookLog:         make([]map[string]interface{}, 0),
+	TicketCounters:     make(map[string]int),
+	AutoCreateMappings: make(map[string]bool),
+}
+
+// Initialize projects and mappings
+func init() {
+	MockDatabase.Projects = map[string]interface{}{
 		"AUDIT": map[string]interface{}{
 			"key":  "AUDIT",
 			"name": "Audit Management",
 		},
-	},
-}
+		"RISK": map[string]interface{}{
+			"key":  "RISK",
+			"name": "Risk Management",
+		},
+		"INC": map[string]interface{}{
+			"key":  "INC",
+			"name": "Incident Management",
+		},
+		"COMP": map[string]interface{}{
+			"key":  "COMP",
+			"name": "Compliance Tasks",
+		},
+		"VEN": map[string]interface{}{
+			"key":  "VEN",
+			"name": "Vendor Risk",
+		},
+		"REG": map[string]interface{}{
+			"key":  "REG",
+			"name": "Regulatory Changes",
+		},
+	}
 
-// ServiceNowJiraMapping maps ServiceNow IDs to Jira ticket keys
-var ServiceNowJiraMapping = map[string]string{}
+	// Initialize counters for each project
+	for key := range MockDatabase.Projects {
+		MockDatabase.TicketCounters[key] = 0
+	}
+
+	// Set default auto-create mappings
+	MockDatabase.AutoCreateMappings = map[string]bool{
+		"sn_risk_risk":           true,
+		"sn_compliance_task":     true,
+		"sn_si_incident":         true,
+		"sn_policy_control_test": true,
+		"sn_audit_finding":       true,
+		"sn_vendor_risk":         true,
+		"sn_regulatory_change":   true,
+	}
+}
 
 func main() {
 	r := mux.NewRouter()
@@ -80,37 +139,51 @@ func main() {
 	r.HandleFunc("/rest/api/2/project", handleProjects).Methods("GET")
 	r.HandleFunc("/rest/api/2/search", handleSearchIssues).Methods("GET")
 
-	// Webhook receiver
+	// Webhook receiver for ServiceNow
+	r.HandleFunc("/api/webhooks/servicenow", handleServiceNowWebhook).Methods("POST")
+
+	// Webhook receiver for Jira
 	r.HandleFunc("/api/webhooks/jira", handleReceiveWebhook).Methods("POST")
 
-	// Webhook trigger
+	// Webhook trigger endpoints
 	r.HandleFunc("/trigger_webhook/{event_type}", triggerWebhook).Methods("POST")
+
+	// Integration configuration
+	r.HandleFunc("/api/config/auto_create", handleAutoCreateConfig).Methods("GET", "POST")
+
+	// Webhook log access
+	r.HandleFunc("/api/webhook_logs", getWebhookLogs).Methods("GET")
 
 	// Reset endpoint
 	r.HandleFunc("/reset", handleReset).Methods("POST")
 
 	// Health check and UI
 	r.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok"}`))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":   "ok",
+			"version":  "1.2.0",
+			"database": fmt.Sprintf("%d tickets", len(MockDatabase.Tickets)),
+		})
 	}).Methods("GET")
 
 	r.HandleFunc("/", handleUI).Methods("GET")
 
 	// Start server
 	port := "5000"
-	fmt.Printf("Starting mock Jira server on port %s...\n", port)
+	log.Printf("[JIRA MOCK] Starting mock Jira server on port %s...\n", port)
+
 	log.Fatal(http.ListenAndServe(":"+port, r))
 }
 
+// JIRA API HANDLERS
 func handleIssues(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	switch r.Method {
 	case "GET":
-		tickets := MockDatabase["tickets"].(map[string]JiraTicket)
 		var results []JiraTicket
-		for _, ticket := range tickets {
+		for _, ticket := range MockDatabase.Tickets {
 			results = append(results, ticket)
 		}
 		json.NewEncoder(w).Encode(results)
@@ -128,17 +201,23 @@ func handleIssues(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		tickets := MockDatabase["tickets"].(map[string]JiraTicket)
-		id := fmt.Sprintf("10%d", len(tickets)+1)
-		keyNum := len(tickets) + 1
-		var key string
-		for {
-			key = fmt.Sprintf("AUDIT-%d", keyNum)
-			if _, exists := tickets[key]; !exists {
-				break
+		// Determine project key from the project field or default to AUDIT
+		projectKey := "AUDIT"
+		if project, ok := fields["project"].(map[string]interface{}); ok {
+			if key, ok := project["key"].(string); ok && key != "" {
+				projectKey = key
 			}
-			keyNum++
 		}
+
+		// Generate ID and issue key
+		id := fmt.Sprintf("10%d", len(MockDatabase.Tickets)+1)
+
+		// Get the counter for this project and increment it
+		counter := MockDatabase.TicketCounters[projectKey]
+		counter++
+		MockDatabase.TicketCounters[projectKey] = counter
+
+		key := fmt.Sprintf("%s-%d", projectKey, counter)
 
 		summary := ""
 		if sum, ok := fields["summary"].(string); ok {
@@ -147,6 +226,12 @@ func handleIssues(w http.ResponseWriter, r *http.Request) {
 		description := ""
 		if desc, ok := fields["description"].(string); ok {
 			description = desc
+		}
+		priority := "Medium"
+		if p, ok := fields["priority"].(map[string]interface{}); ok {
+			if name, ok := p["name"].(string); ok {
+				priority = name
+			}
 		}
 		dueDate := ""
 		if dd, ok := fields["duedate"].(string); ok {
@@ -174,13 +259,29 @@ func handleIssues(w http.ResponseWriter, r *http.Request) {
 			fields["customfield_servicenow_id"] = snID
 		}
 
+		// Either remove the unused variable or use it somewhere
+		// Option 1: Simply remove this code block if not needed
+		/*
+			issueType := "Task"
+			if it, ok := fields["issuetype"].(map[string]interface{}); ok {
+				if name, ok := it["name"].(string); ok {
+					issueType = name
+				}
+			}
+		*/
+
+		// Option 2: If we need to keep track of the issue type, store it in a field
+		// This ensures the variable is used and not just declared
+		// fields["issue_type_stored"] = issueType
+
 		ticket := JiraTicket{
 			ID:          id,
 			Key:         key,
-			Self:        fmt.Sprintf("http://localhost:3001/rest/api/2/issue/%s", key),
+			Self:        fmt.Sprintf("http://localhost:5000/rest/api/2/issue/%s", key),
 			Summary:     summary,
 			Description: description,
 			Status:      "To Do",
+			Priority:    priority,
 			Created:     time.Now().Format(time.RFC3339),
 			Updated:     time.Now().Format(time.RFC3339),
 			DueDate:     dueDate,
@@ -190,12 +291,14 @@ func handleIssues(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if serviceNowID != "" {
-			ServiceNowJiraMapping[serviceNowID] = key
+			MockDatabase.ServiceNowJiraMap[serviceNowID] = key
 		}
 
-		tickets[key] = ticket
-		MockDatabase["tickets"] = tickets
-		log.Printf("Created Jira issue: %s with customfield_servicenow_id: %v", key, ticket.Fields["customfield_servicenow_id"])
+		MockDatabase.Tickets[key] = ticket
+
+		// Log the creation
+		log.Printf("[JIRA MOCK] Created issue: %s - %s with ServiceNow ID: %s",
+			key, summary, serviceNowID)
 
 		json.NewEncoder(w).Encode(map[string]string{
 			"id":   id,
@@ -210,8 +313,7 @@ func handleIssueByKey(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	key := vars["key"]
 
-	tickets := MockDatabase["tickets"].(map[string]JiraTicket)
-	ticket, exists := tickets[key]
+	ticket, exists := MockDatabase.Tickets[key]
 	if !exists {
 		http.Error(w, "Issue not found", http.StatusNotFound)
 		return
@@ -255,23 +357,35 @@ func handleIssueByKey(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			for k, v := range fields {
+				if ticket.Fields == nil {
+					ticket.Fields = make(map[string]interface{})
+				}
 				ticket.Fields[k] = v
 			}
 		}
 
 		previousStatus := ticket.Status // Store previous status for changelog
 		ticket.Updated = time.Now().Format(time.RFC3339)
-		tickets[key] = ticket
-		MockDatabase["tickets"] = tickets
-		log.Printf("Updated Jira issue: %s to status: %s", key, ticket.Status)
+		MockDatabase.Tickets[key] = ticket
+
+		log.Printf("[JIRA MOCK] Updated issue: %s to status: %s", key, ticket.Status)
 
 		w.WriteHeader(http.StatusNoContent)
+
+		// Send update back to ServiceNow if this has a ServiceNow ID
+		if ticket.Fields != nil {
+			if serviceNowID, ok := ticket.Fields["customfield_servicenow_id"].(string); ok && serviceNowID != "" {
+				go notifyServiceNowOfStatusChange(serviceNowID, ticket.Status, previousStatus)
+			}
+		}
+
 		go triggerStatusChangeWebhook(key, ticket.Status, previousStatus)
 
 	case "DELETE":
-		delete(tickets, key)
-		MockDatabase["tickets"] = tickets
+		delete(MockDatabase.Tickets, key)
 		w.WriteHeader(http.StatusNoContent)
+
+		log.Printf("[JIRA MOCK] Deleted issue: %s", key)
 	}
 }
 
@@ -280,8 +394,7 @@ func handleComments(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	key := vars["key"]
 
-	tickets := MockDatabase["tickets"].(map[string]JiraTicket)
-	ticket, exists := tickets[key]
+	ticket, exists := MockDatabase.Tickets[key]
 	if !exists {
 		http.Error(w, "Issue not found", http.StatusNotFound)
 		return
@@ -308,16 +421,32 @@ func handleComments(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Determine author
+		author := "mock-user"
+		if userData, ok := commentData["author"].(map[string]interface{}); ok {
+			if name, ok := userData["name"].(string); ok {
+				author = name
+			}
+		}
+
 		comment := JiraComment{
 			ID:      fmt.Sprintf("comment-%d", len(ticket.Comments)+1),
 			Body:    body,
-			Author:  "mock-user",
+			Author:  author,
 			Created: time.Now().Format(time.RFC3339),
 		}
 
 		ticket.Comments = append(ticket.Comments, comment)
-		tickets[key] = ticket
-		MockDatabase["tickets"] = tickets
+		MockDatabase.Tickets[key] = ticket
+
+		log.Printf("[JIRA MOCK] Added comment to issue %s: %s", key, body)
+
+		// Forward comment to ServiceNow if applicable
+		if ticket.Fields != nil {
+			if serviceNowID, ok := ticket.Fields["customfield_servicenow_id"].(string); ok && serviceNowID != "" {
+				go addCommentToServiceNow(serviceNowID, body, author)
+			}
+		}
 
 		json.NewEncoder(w).Encode(comment)
 	}
@@ -328,8 +457,7 @@ func handleTransitions(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	key := vars["key"]
 
-	tickets := MockDatabase["tickets"].(map[string]JiraTicket)
-	ticket, exists := tickets[key]
+	ticket, exists := MockDatabase.Tickets[key]
 	if !exists {
 		http.Error(w, "Issue not found", http.StatusNotFound)
 		return
@@ -413,10 +541,20 @@ func handleTransitions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		ticket.Updated = time.Now().Format(time.RFC3339)
-		tickets[key] = ticket
-		MockDatabase["tickets"] = tickets
+		MockDatabase.Tickets[key] = ticket
+
+		log.Printf("[JIRA MOCK] Transitioned issue %s from %s to %s",
+			key, previousStatus, ticket.Status)
 
 		w.WriteHeader(http.StatusNoContent)
+
+		// Send update back to ServiceNow if this has a ServiceNow ID
+		if ticket.Fields != nil {
+			if serviceNowID, ok := ticket.Fields["customfield_servicenow_id"].(string); ok && serviceNowID != "" {
+				go notifyServiceNowOfStatusChange(serviceNowID, ticket.Status, previousStatus)
+			}
+		}
+
 		go triggerStatusChangeWebhook(key, ticket.Status, previousStatus)
 	}
 }
@@ -424,9 +562,8 @@ func handleTransitions(w http.ResponseWriter, r *http.Request) {
 func handleProjects(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	projects := MockDatabase["projects"].(map[string]interface{})
 	var projectList []interface{}
-	for _, project := range projects {
+	for _, project := range MockDatabase.Projects {
 		projectList = append(projectList, project)
 	}
 
@@ -442,29 +579,66 @@ func handleSearchIssues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tickets := MockDatabase["tickets"].(map[string]JiraTicket)
 	var results []JiraTicket
 
-	// Parse JQL (e.g., "project=AUDIT AND customfield_servicenow_id=ctrl003")
+	// Parse JQL (e.g., "project=AUDIT AND customfield_servicenow_id=CTRL003")
 	jqlParts := strings.Split(jql, " AND ")
-	projectFilter := ""
-	customFieldFilter := ""
+	filters := make(map[string]string)
+
 	for _, part := range jqlParts {
-		if strings.HasPrefix(part, "project=") {
-			projectFilter = strings.TrimPrefix(part, "project=")
-		}
-		if strings.HasPrefix(part, "customfield_servicenow_id=") {
-			customFieldFilter = strings.TrimPrefix(part, "customfield_servicenow_id=")
+		if strings.Contains(part, "=") {
+			partSplit := strings.SplitN(part, "=", 2)
+			if len(partSplit) == 2 {
+				key := strings.TrimSpace(partSplit[0])
+				value := strings.Trim(strings.TrimSpace(partSplit[1]), "\"'")
+				filters[key] = value
+			}
 		}
 	}
 
-	for _, ticket := range tickets {
-		matchesProject := projectFilter == "" || strings.HasPrefix(ticket.Key, projectFilter)
-		matchesCustomField := customFieldFilter == "" || (ticket.Fields["customfield_servicenow_id"] != nil && ticket.Fields["customfield_servicenow_id"].(string) == customFieldFilter)
-		if matchesProject && matchesCustomField {
+	log.Printf("[JIRA MOCK] Search with filters: %v", filters)
+
+	for _, ticket := range MockDatabase.Tickets {
+		matches := true
+
+		// Project filter
+		if projectKey, ok := filters["project"]; ok {
+			if !strings.HasPrefix(ticket.Key, projectKey) {
+				matches = false
+			}
+		}
+
+		// ServiceNow ID filter
+		if snID, ok := filters["customfield_servicenow_id"]; ok {
+			if ticket.Fields == nil || ticket.Fields["customfield_servicenow_id"] == nil ||
+				ticket.Fields["customfield_servicenow_id"].(string) != snID {
+				matches = false
+			}
+		}
+
+		// Summary filter
+		if summary, ok := filters["summary ~ "]; ok {
+			if !strings.Contains(strings.ToLower(ticket.Summary), strings.ToLower(summary)) {
+				matches = false
+			}
+		}
+
+		// Status filter
+		if status, ok := filters["status"]; ok {
+			if !strings.EqualFold(ticket.Status, status) {
+				matches = false
+			}
+		}
+
+		if matches {
+			// Add formatted fields to the ticket
 			if ticket.Fields == nil {
 				ticket.Fields = make(map[string]interface{})
 			}
+
+			// Add proper formatted fields for the API response
+			ticket.Fields["summary"] = ticket.Summary
+			ticket.Fields["description"] = ticket.Description
 			ticket.Fields["duedate"] = ticket.DueDate
 			ticket.Fields["assignee"] = map[string]interface{}{
 				"name": ticket.Assignee,
@@ -472,11 +646,15 @@ func handleSearchIssues(w http.ResponseWriter, r *http.Request) {
 			ticket.Fields["status"] = map[string]interface{}{
 				"name": ticket.Status,
 			}
+			ticket.Fields["priority"] = map[string]interface{}{
+				"name": ticket.Priority,
+			}
+
 			results = append(results, ticket)
 		}
 	}
 
-	log.Printf("Search JQL: %s, Found: %d issues", jql, len(results))
+	log.Printf("[JIRA MOCK] Search JQL: %s, Found: %d issues", jql, len(results))
 
 	response := map[string]interface{}{
 		"issues":     results,
@@ -487,6 +665,8 @@ func handleSearchIssues(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// WEBHOOK HANDLERS
+
 func handleReceiveWebhook(w http.ResponseWriter, r *http.Request) {
 	var payload map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
@@ -494,9 +674,194 @@ func handleReceiveWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Received webhook from Jira: %v", payload)
+	// Log the received webhook
+	log.Printf("[JIRA MOCK] Received webhook: %v", payload)
+
+	// Add to webhook log
+	logEntry := map[string]interface{}{
+		"timestamp": time.Now().Format(time.RFC3339),
+		"type":      "incoming",
+		"source":    "external",
+		"payload":   payload,
+	}
+	MockDatabase.WebhookLog = append(MockDatabase.WebhookLog, logEntry)
+
+	// Limit log size
+	if len(MockDatabase.WebhookLog) > 100 {
+		MockDatabase.WebhookLog = MockDatabase.WebhookLog[len(MockDatabase.WebhookLog)-100:]
+	}
+
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status":"received"}`))
+}
+
+// Complete overhaul of the handleServiceNowWebhook function to fix ServiceNow GRC integration
+func handleServiceNowWebhook(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Read and save the request body for debugging
+	requestBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("[JIRA MOCK] ERROR reading ServiceNow webhook body: %v", err)
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+
+	// Log the raw request body
+	log.Printf("[JIRA MOCK] RAW ServiceNow webhook payload: %s", string(requestBody))
+
+	// Restore the body for further processing
+	r.Body = io.NopCloser(bytes.NewBuffer(requestBody))
+
+	// Try to decode as a standard ServiceNowWebhookPayload
+	var payload ServiceNowWebhookPayload
+	if err := json.NewDecoder(bytes.NewBuffer(requestBody)).Decode(&payload); err != nil {
+		log.Printf("[JIRA MOCK] WARNING: Failed to parse standard ServiceNow payload: %v", err)
+
+		// If standard parsing fails, try to parse as a raw map for flexibility
+		var rawPayload map[string]interface{}
+		if err := json.NewDecoder(bytes.NewBuffer(requestBody)).Decode(&rawPayload); err != nil {
+			log.Printf("[JIRA MOCK] ERROR: Failed to parse ServiceNow webhook as raw JSON: %v", err)
+			http.Error(w, "Invalid JSON in request body", http.StatusBadRequest)
+			return
+		}
+
+		// Log the raw payload structure
+		log.Printf("[JIRA MOCK] ServiceNow raw payload structure received:")
+		for key, value := range rawPayload {
+			log.Printf("[JIRA MOCK]   %s: %v (%T)", key, value, value)
+		}
+
+		// Convert the raw payload to our expected format
+		if sysID, ok := rawPayload["sys_id"].(string); ok {
+			payload.SysID = sysID
+		} else if id, ok := rawPayload["id"].(string); ok {
+			payload.SysID = id
+		}
+
+		if tableName, ok := rawPayload["table_name"].(string); ok {
+			payload.TableName = tableName
+		} else if tableName, ok := rawPayload["table"].(string); ok {
+			payload.TableName = tableName
+		} else {
+			// Default to risk table for GRC if not specified
+			payload.TableName = "sn_risk_risk"
+			log.Printf("[JIRA MOCK] No table name found, defaulting to sn_risk_risk")
+		}
+
+		if actionType, ok := rawPayload["action_type"].(string); ok {
+			payload.ActionType = actionType
+		} else if action, ok := rawPayload["action"].(string); ok {
+			payload.ActionType = action
+		} else {
+			payload.ActionType = "insert" // Default to insert if not specified
+			log.Printf("[JIRA MOCK] No action type found, defaulting to insert")
+		}
+
+		// Convert data section if present
+		if data, ok := rawPayload["data"].(map[string]interface{}); ok {
+			payload.Data = data
+		} else {
+			// If no data section, use the whole payload as data
+			payload.Data = rawPayload
+			log.Printf("[JIRA MOCK] No data section found, using entire payload as data")
+		}
+	}
+
+	// Ensure we have the minimum required fields
+	if payload.SysID == "" {
+		if id, ok := payload.Data["sys_id"].(string); ok {
+			payload.SysID = id
+		} else if id, ok := payload.Data["id"].(string); ok {
+			payload.SysID = id
+		} else if id, ok := payload.Data["number"].(string); ok {
+			payload.SysID = id
+		} else {
+			// Generate a random ID if none found
+			payload.SysID = fmt.Sprintf("GRC-%d", time.Now().Unix())
+			log.Printf("[JIRA MOCK] No sys_id found, generating one: %s", payload.SysID)
+		}
+	}
+
+	// Ensure we have a valid action type
+	if payload.ActionType == "" {
+		payload.ActionType = "insert"
+		log.Printf("[JIRA MOCK] No action_type found, defaulting to insert")
+	}
+
+	// Extract and log title/summary for better logging
+	title := "Unknown"
+	if t, ok := payload.Data["title"].(string); ok && t != "" {
+		title = t
+	} else if t, ok := payload.Data["short_description"].(string); ok && t != "" {
+		title = t
+	} else if t, ok := payload.Data["name"].(string); ok && t != "" {
+		title = t
+	}
+
+	// Log what we've parsed from the payload
+	log.Printf("[JIRA MOCK] ServiceNow webhook processed: SysID=%s, Table=%s, Action=%s, Title=%s",
+		payload.SysID, payload.TableName, payload.ActionType, title)
+
+	// Add to webhook log
+	logEntry := map[string]interface{}{
+		"timestamp": time.Now().Format(time.RFC3339),
+		"type":      "incoming",
+		"source":    "servicenow",
+		"table":     payload.TableName,
+		"action":    payload.ActionType,
+		"sys_id":    payload.SysID,
+		"title":     title,
+	}
+	MockDatabase.WebhookLog = append(MockDatabase.WebhookLog, logEntry)
+
+	// Handle based on the action type
+	switch payload.ActionType {
+	case "insert", "created", "create":
+		// Always create a ticket for GRC items, regardless of mapping
+		createJiraTicketFromServiceNow(payload)
+
+	case "update", "updated", "modify", "modified":
+		// Find the corresponding Jira ticket and update it
+		jiraKey, exists := MockDatabase.ServiceNowJiraMap[payload.SysID]
+		if exists {
+			updateJiraTicketFromServiceNow(jiraKey, payload)
+		} else {
+			log.Printf("[JIRA MOCK] No matching Jira ticket found for ServiceNow item %s, creating new ticket",
+				payload.SysID)
+			// If update comes in for an item we don't have, create it
+			createJiraTicketFromServiceNow(payload)
+		}
+
+	case "delete", "deleted", "remove", "removed":
+		// Find the corresponding Jira ticket and mark it
+		jiraKey, exists := MockDatabase.ServiceNowJiraMap[payload.SysID]
+		if exists {
+			ticket, ticketExists := MockDatabase.Tickets[jiraKey]
+			if ticketExists {
+				// Mark as deleted in Jira but don't actually delete
+				ticket.Status = "Closed"
+				ticket.Resolution = "Won't Fix"
+				ticket.Updated = time.Now().Format(time.RFC3339)
+
+				if ticket.Fields == nil {
+					ticket.Fields = make(map[string]interface{})
+				}
+				ticket.Fields["servicenow_deleted"] = true
+
+				MockDatabase.Tickets[jiraKey] = ticket
+
+				log.Printf("[JIRA MOCK] Marked ticket %s as closed due to ServiceNow deletion", jiraKey)
+			}
+		}
+	}
+
+	// Return success
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "success",
+		"message": "Webhook processed successfully",
+	})
 }
 
 func triggerWebhook(w http.ResponseWriter, r *http.Request) {
@@ -535,22 +900,36 @@ func triggerWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonPayload, _ := json.Marshal(webhookPayload)
-	resp, err := http.Post(webhookURL, "application/json", strings.NewReader(string(jsonPayload)))
+	resp, err := http.Post(webhookURL, "application/json", bytes.NewReader(jsonPayload))
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Error sending webhook: %v", err), http.StatusInternalServerError)
 		return
 	}
 	defer resp.Body.Close()
 
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":     "success",
-		"message":    fmt.Sprintf("Jira webhook sent to %s", webhookURL),
-		"webhook_id": fmt.Sprintf("mock-jira-webhook-%d", time.Now().UnixNano()),
-		"event_type": eventType,
-		"issue_key":  issueKey,
-	})
+	// Log the outgoing webhook
+	logEntry := map[string]interface{}{
+		"timestamp": time.Now().Format(time.RFC3339),
+		"type":      "outgoing",
+		"target":    webhookURL,
+		"event":     eventType,
+		"issue_key": issueKey,
+	}
+	MockDatabase.WebhookLog = append(MockDatabase.WebhookLog, logEntry)
+
+	if w != nil {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":     "success",
+			"message":    fmt.Sprintf("Jira webhook sent to %s", webhookURL),
+			"webhook_id": fmt.Sprintf("mock-jira-webhook-%d", time.Now().UnixNano()),
+			"event_type": eventType,
+			"issue_key":  issueKey,
+		})
+	}
 }
+
+///////////////////////////////////////////////////////////////////
 
 func triggerStatusChangeWebhook(issueKey string, newStatus string, previousStatus string) {
 	payload := buildIssueWebhookPayload(issueKey, "updated", map[string]interface{}{
@@ -593,17 +972,28 @@ func triggerStatusChangeWebhook(issueKey string, newStatus string, previousStatu
 	jsonPayload, _ := json.Marshal(payload)
 	resp, err := http.Post(webhookURL, "application/json", strings.NewReader(string(jsonPayload)))
 	if err != nil {
-		log.Printf("Error sending status change webhook: %v", err)
+		log.Printf("[JIRA MOCK] Error sending status change webhook: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	log.Printf("Status change webhook sent for issue %s (from %s to %s)", issueKey, previousStatus, newStatus)
+	// Log the outgoing webhook
+	logEntry := map[string]interface{}{
+		"timestamp": time.Now().Format(time.RFC3339),
+		"type":      "outgoing",
+		"target":    webhookURL,
+		"event":     "jira:issue_updated",
+		"issue_key": issueKey,
+		"changes":   fmt.Sprintf("Status: %s → %s", previousStatus, newStatus),
+	}
+	MockDatabase.WebhookLog = append(MockDatabase.WebhookLog, logEntry)
+
+	log.Printf("[JIRA MOCK] Status change webhook sent for issue %s (from %s to %s)",
+		issueKey, previousStatus, newStatus)
 }
 
 func buildIssueWebhookPayload(issueKey string, action string, data map[string]interface{}) map[string]interface{} {
-	tickets := MockDatabase["tickets"].(map[string]JiraTicket)
-	ticket, exists := tickets[issueKey]
+	ticket, exists := MockDatabase.Tickets[issueKey]
 
 	summary := "Mock issue"
 	description := "This is a mock issue for testing"
@@ -636,7 +1026,7 @@ func buildIssueWebhookPayload(issueKey string, action string, data map[string]in
 
 	if snID, ok := data["servicenow_id"].(string); ok && snID != "" {
 		issueFields["customfield_servicenow_id"] = snID
-	} else if exists && ticket.Fields["customfield_servicenow_id"] != nil {
+	} else if exists && ticket.Fields != nil && ticket.Fields["customfield_servicenow_id"] != nil {
 		issueFields["customfield_servicenow_id"] = ticket.Fields["customfield_servicenow_id"]
 	}
 
@@ -645,7 +1035,7 @@ func buildIssueWebhookPayload(issueKey string, action string, data map[string]in
 		"issue": map[string]interface{}{
 			"id":     issueKey,
 			"key":    issueKey,
-			"self":   fmt.Sprintf("http://localhost:3001/rest/api/2/issue/%s", issueKey),
+			"self":   fmt.Sprintf("http://localhost:5000/rest/api/2/issue/%s", issueKey),
 			"fields": issueFields,
 		},
 		"user": map[string]interface{}{
@@ -667,15 +1057,22 @@ func buildCommentWebhookPayload(issueKey string, action string, data map[string]
 		commentID = id
 	}
 
+	author := "mock-user"
+	authorDisplay := "Mock User"
+	if authorName, ok := data["author"].(string); ok && authorName != "" {
+		author = authorName
+		authorDisplay = strings.Title(strings.Replace(authorName, ".", " ", -1))
+	}
+
 	issuePayload := buildIssueWebhookPayload(issueKey, "commented", data)
 	issuePayload["webhookEvent"] = "comment_" + action
 	issuePayload["comment"] = map[string]interface{}{
 		"id":   commentID,
 		"body": commentBody,
 		"author": map[string]interface{}{
-			"name":         "mock-user",
-			"displayName":  "Mock User",
-			"emailAddress": "mock@example.com",
+			"name":         author,
+			"displayName":  authorDisplay,
+			"emailAddress": author + "@example.com",
 		},
 		"created": time.Now().Format(time.RFC3339),
 		"updated": time.Now().Format(time.RFC3339),
@@ -685,16 +1082,648 @@ func buildCommentWebhookPayload(issueKey string, action string, data map[string]
 }
 
 func handleReset(w http.ResponseWriter, r *http.Request) {
-	MockDatabase["tickets"] = map[string]JiraTicket{}
-	ServiceNowJiraMapping = map[string]string{}
-	log.Printf("Mock Jira database reset")
+	MockDatabase.Tickets = make(map[string]JiraTicket)
+	MockDatabase.ServiceNowJiraMap = make(map[string]string)
+	MockDatabase.WebhookLog = make([]map[string]interface{}, 0)
+
+	// Reset counters but keep the ticketCounter map intact
+	for key := range MockDatabase.TicketCounters {
+		MockDatabase.TicketCounters[key] = 0
+	}
+
+	log.Printf("[JIRA MOCK] Database reset")
+
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status":"reset"}`))
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "success",
+		"message": "Database reset successfully",
+	})
+}
+func handleAutoCreateConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method == "GET" {
+		json.NewEncoder(w).Encode(MockDatabase.AutoCreateMappings)
+		return
+	}
+
+	if r.Method == "POST" {
+		var configUpdate map[string]bool
+		if err := json.NewDecoder(r.Body).Decode(&configUpdate); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		// Update the auto-create mappings
+		for tableName, enabled := range configUpdate {
+			MockDatabase.AutoCreateMappings[tableName] = enabled
+		}
+
+		log.Printf("[JIRA MOCK] Updated auto-create mappings: %v", MockDatabase.AutoCreateMappings)
+
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "success",
+			"message": "Auto-create mappings updated",
+		})
+	}
+}
+
+func getWebhookLogs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	limit := 50 // Default limit
+	if limitParam := r.URL.Query().Get("limit"); limitParam != "" {
+		fmt.Sscanf(limitParam, "%d", &limit)
+		if limit <= 0 {
+			limit = 50
+		}
+	}
+
+	// Return the most recent logs up to the limit
+	startIdx := 0
+	if len(MockDatabase.WebhookLog) > limit {
+		startIdx = len(MockDatabase.WebhookLog) - limit
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"logs":  MockDatabase.WebhookLog[startIdx:],
+		"total": len(MockDatabase.WebhookLog),
+		"limit": limit,
+	})
+}
+
+func createJiraTicketFromServiceNow(payload ServiceNowWebhookPayload) {
+	log.Printf("[JIRA MOCK] Starting ticket creation for ServiceNow item %s", payload.SysID)
+
+	data := payload.Data
+
+	// First, determine which Jira project to use based on ServiceNow table
+	var projectKey string
+
+	// Map ServiceNow table names to Jira projects
+	switch {
+	case strings.Contains(payload.TableName, "risk"):
+		projectKey = "RISK"
+		log.Printf("[JIRA MOCK] Mapping to RISK project")
+	case strings.Contains(payload.TableName, "compliance"):
+		projectKey = "COMP"
+		log.Printf("[JIRA MOCK] Mapping to COMP project")
+	case strings.Contains(payload.TableName, "incident"):
+		projectKey = "INC"
+		log.Printf("[JIRA MOCK] Mapping to INC project")
+	case strings.Contains(payload.TableName, "audit"):
+		projectKey = "AUDIT"
+		log.Printf("[JIRA MOCK] Mapping to AUDIT project")
+	case strings.Contains(payload.TableName, "vendor"):
+		projectKey = "VEN"
+		log.Printf("[JIRA MOCK] Mapping to VEN project")
+	case strings.Contains(payload.TableName, "regulatory"):
+		projectKey = "REG"
+		log.Printf("[JIRA MOCK] Mapping to REG project")
+	default:
+		projectKey = "AUDIT"
+		log.Printf("[JIRA MOCK] No specific mapping found, defaulting to AUDIT project")
+	}
+
+	// Extract common fields
+	var summary string
+	if title, ok := data["title"].(string); ok && title != "" {
+		log.Printf("[JIRA MOCK] Using title field for summary: %s", title)
+		summary = title
+	} else if shortDesc, ok := data["short_description"].(string); ok && shortDesc != "" {
+		log.Printf("[JIRA MOCK] Using short_description field for summary: %s", shortDesc)
+		summary = shortDesc
+	} else if name, ok := data["name"].(string); ok && name != "" {
+		log.Printf("[JIRA MOCK] Using name field for summary: %s", name)
+		summary = name
+	} else {
+		summary = fmt.Sprintf("ServiceNow %s: %s",
+			strings.Replace(payload.TableName, "sn_", "", 1), payload.SysID)
+		log.Printf("[JIRA MOCK] No title found, using default summary: %s", summary)
+	}
+
+	var description string
+	if desc, ok := data["description"].(string); ok && desc != "" {
+		description = desc
+		log.Printf("[JIRA MOCK] Using description field: %s", description)
+	} else if notes, ok := data["notes"].(string); ok && notes != "" {
+		description = notes
+		log.Printf("[JIRA MOCK] Using notes field for description: %s", description)
+	} else if comments, ok := data["comments"].(string); ok && comments != "" {
+		description = comments
+		log.Printf("[JIRA MOCK] Using comments field for description: %s", description)
+	} else {
+		description = fmt.Sprintf("ServiceNow item imported from %s with ID: %s",
+			payload.TableName, payload.SysID)
+		log.Printf("[JIRA MOCK] No description found, using default: %s", description)
+	}
+
+	// Build fields map for Jira issue
+	fields := map[string]interface{}{
+		"project": map[string]string{
+			"key": projectKey,
+		},
+		"issuetype": map[string]string{
+			"name": "Task", // Default issue type
+		},
+		"summary":                   summary,
+		"description":               description,
+		"customfield_servicenow_id": payload.SysID,
+	}
+
+	// Add priority if available
+	if severity, ok := data["severity"].(string); ok && severity != "" {
+		var priority string
+		switch strings.ToLower(severity) {
+		case "critical", "high", "1":
+			priority = "High"
+		case "medium", "moderate", "2":
+			priority = "Medium"
+		case "low", "3":
+			priority = "Low"
+		default:
+			priority = "Medium"
+		}
+
+		fields["priority"] = map[string]string{
+			"name": priority,
+		}
+		log.Printf("[JIRA MOCK] Setting priority to %s based on severity %s", priority, severity)
+	} else if priority, ok := data["priority"].(string); ok && priority != "" {
+		var jiraPriority string
+		switch strings.ToLower(priority) {
+		case "critical", "high", "1":
+			jiraPriority = "High"
+		case "medium", "moderate", "2":
+			jiraPriority = "Medium"
+		case "low", "3":
+			jiraPriority = "Low"
+		default:
+			jiraPriority = "Medium"
+		}
+
+		fields["priority"] = map[string]string{
+			"name": jiraPriority,
+		}
+		log.Printf("[JIRA MOCK] Setting priority to %s based on priority %s", jiraPriority, priority)
+	}
+
+	// Add due date if available
+	if dueDate, ok := data["due_date"].(string); ok && dueDate != "" {
+		fields["duedate"] = dueDate
+		log.Printf("[JIRA MOCK] Setting due date to %s", dueDate)
+	}
+
+	// Add assignee if available
+	if assignee, ok := data["assigned_to"].(string); ok && assignee != "" {
+		fields["assignee"] = map[string]string{
+			"name": assignee,
+		}
+		log.Printf("[JIRA MOCK] Setting assignee to %s from assigned_to", assignee)
+	} else if owner, ok := data["owner"].(string); ok && owner != "" {
+		fields["assignee"] = map[string]string{
+			"name": owner,
+		}
+		log.Printf("[JIRA MOCK] Setting assignee to %s from owner", owner)
+	} else if assignedTo, ok := data["assigned_to_user"].(string); ok && assignedTo != "" {
+		fields["assignee"] = map[string]string{
+			"name": assignedTo,
+		}
+		log.Printf("[JIRA MOCK] Setting assignee to %s from assigned_to_user", assignedTo)
+	}
+
+	// Create direct issue via the Jira API
+	log.Printf("[JIRA MOCK] Creating Jira ticket with fields: %+v", fields)
+
+	// Create the request body
+	requestBody := map[string]interface{}{
+		"fields": fields,
+	}
+
+	// Convert to JSON
+	jsonBody, err := json.Marshal(requestBody)
+	if err != nil {
+		log.Printf("[JIRA MOCK] Error marshalling request body: %v", err)
+		return
+	}
+
+	// Print the full JSON request for debugging
+	log.Printf("[JIRA MOCK] Sending Jira API request: %s", string(jsonBody))
+
+	// Make the API call to create the Jira issue
+	resp, err := http.Post("http://localhost:5000/rest/api/2/issue",
+		"application/json", bytes.NewBuffer(jsonBody))
+
+	if err != nil {
+		log.Printf("[JIRA MOCK] Error creating Jira ticket: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read the response body
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("[JIRA MOCK] Error reading response body: %v", err)
+		return
+	}
+
+	// Log the response
+	log.Printf("[JIRA MOCK] Jira API response status: %d", resp.StatusCode)
+	log.Printf("[JIRA MOCK] Jira API response body: %s", string(respBody))
+
+	// Parse the response
+	var response map[string]interface{}
+	if err := json.Unmarshal(respBody, &response); err != nil {
+		log.Printf("[JIRA MOCK] Error parsing response: %v", err)
+		return
+	}
+
+	// Process the response
+	if key, ok := response["key"].(string); ok {
+		log.Printf("[JIRA MOCK] Successfully created Jira ticket %s for ServiceNow item %s (%s)",
+			key, payload.SysID, summary)
+
+		// Map the ServiceNow ID to the Jira key
+		MockDatabase.ServiceNowJiraMap[payload.SysID] = key
+
+		// Create a JiraTicket struct to directly add to the DB
+		// This ensures the ticket shows up even if API call had issues
+		id := fmt.Sprintf("10%d", len(MockDatabase.Tickets)+1)
+
+		ticket := JiraTicket{
+			ID:          id,
+			Key:         key,
+			Self:        fmt.Sprintf("http://localhost:5000/rest/api/2/issue/%s", key),
+			Summary:     summary,
+			Description: description,
+			Status:      "To Do",
+			Priority:    fields["priority"].(map[string]string)["name"],
+			Created:     time.Now().Format(time.RFC3339),
+			Updated:     time.Now().Format(time.RFC3339),
+			Fields:      fields,
+			Comments:    []JiraComment{},
+		}
+
+		// Add the ticket directly to the database
+		MockDatabase.Tickets[key] = ticket
+		log.Printf("[JIRA MOCK] Added ticket to MockDatabase: %s", key)
+	} else {
+		log.Printf("[JIRA MOCK] Failed to create Jira ticket: %v", response)
+	}
+}
+func updateJiraTicketFromServiceNow(jiraKey string, payload ServiceNowWebhookPayload) {
+	data := payload.Data
+
+	// Get the current ticket
+	ticket, exists := MockDatabase.Tickets[jiraKey]
+	if !exists {
+		log.Printf("[JIRA MOCK] Cannot update Jira ticket %s: not found", jiraKey)
+		return
+	}
+
+	// Start building the update
+	updated := false
+	fields := make(map[string]interface{})
+
+	// Check for title/summary update
+	if title, ok := data["title"].(string); ok && title != "" && title != ticket.Summary {
+		fields["summary"] = title
+		ticket.Summary = title
+		updated = true
+	} else if shortDesc, ok := data["short_description"].(string); ok && shortDesc != "" && shortDesc != ticket.Summary {
+		fields["summary"] = shortDesc
+		ticket.Summary = shortDesc
+		updated = true
+	}
+
+	// Check for description update
+	if desc, ok := data["description"].(string); ok && desc != ticket.Description {
+		fields["description"] = desc
+		ticket.Description = desc
+		updated = true
+	}
+
+	// Check for status update
+	if status, ok := data["status"].(string); ok && status != "" {
+		// Map ServiceNow status to Jira status
+		var jiraStatus string
+		switch strings.ToLower(status) {
+		case "open", "new", "pending":
+			jiraStatus = "To Do"
+		case "in progress", "active":
+			jiraStatus = "In Progress"
+		case "closed", "resolved", "complete", "completed":
+			jiraStatus = "Done"
+		default:
+			// Keep the current status
+			jiraStatus = ticket.Status
+		}
+
+		if jiraStatus != ticket.Status {
+			fields["status"] = map[string]string{
+				"name": jiraStatus,
+			}
+
+			previousStatus := ticket.Status
+			ticket.Status = jiraStatus
+			updated = true
+
+			// If status has changed to Done, add a resolution
+			if jiraStatus == "Done" {
+				fields["resolution"] = map[string]string{
+					"name": "Done",
+				}
+				ticket.Resolution = "Done"
+			}
+
+			// Trigger a status change webhook
+			go triggerStatusChangeWebhook(jiraKey, jiraStatus, previousStatus)
+		}
+	}
+
+	// Check for priority update
+	if severity, ok := data["severity"].(string); ok && severity != "" {
+		var priority string
+		switch strings.ToLower(severity) {
+		case "critical", "high":
+			priority = "High"
+		case "medium":
+			priority = "Medium"
+		case "low":
+			priority = "Low"
+		default:
+			priority = "Medium"
+		}
+
+		if priority != ticket.Priority {
+			fields["priority"] = map[string]string{
+				"name": priority,
+			}
+			ticket.Priority = priority
+			updated = true
+		}
+	}
+
+	// Check for assignee update
+	var newAssignee string
+	if assignee, ok := data["assigned_to"].(string); ok && assignee != "" {
+		newAssignee = assignee
+	} else if owner, ok := data["owner"].(string); ok && owner != "" {
+		newAssignee = owner
+	}
+
+	if newAssignee != "" && newAssignee != ticket.Assignee {
+		fields["assignee"] = map[string]string{
+			"name": newAssignee,
+		}
+		ticket.Assignee = newAssignee
+		updated = true
+	}
+
+	// Check for due date update
+	if dueDate, ok := data["due_date"].(string); ok && dueDate != "" && dueDate != ticket.DueDate {
+		fields["duedate"] = dueDate
+		ticket.DueDate = dueDate
+		updated = true
+	}
+
+	// Update the database record
+	if updated {
+		ticket.Updated = time.Now().Format(time.RFC3339)
+		MockDatabase.Tickets[jiraKey] = ticket
+
+		// Store all fields in the ticket's Fields map
+		if ticket.Fields == nil {
+			ticket.Fields = make(map[string]interface{})
+		}
+		for k, v := range fields {
+			ticket.Fields[k] = v
+		}
+
+		log.Printf("[JIRA MOCK] Updated Jira ticket %s from ServiceNow change", jiraKey)
+	} else {
+		log.Printf("[JIRA MOCK] No changes needed for Jira ticket %s", jiraKey)
+	}
+}
+
+func notifyServiceNowOfStatusChange(serviceNowID string, newStatus string, previousStatus string) {
+	// Map Jira status to ServiceNow status
+	var snStatus string
+	switch newStatus {
+	case "To Do":
+		snStatus = "Open"
+	case "In Progress":
+		snStatus = "In Progress"
+	case "Done":
+		snStatus = "Closed"
+	default:
+		snStatus = newStatus // Use the same status if no mapping exists
+	}
+
+	// Determine the ServiceNow table from the ID format
+	var tableName string
+	if strings.HasPrefix(serviceNowID, "RISK") {
+		tableName = "sn_risk_risk"
+	} else if strings.HasPrefix(serviceNowID, "INC") {
+		tableName = "sn_si_incident"
+	} else if strings.HasPrefix(serviceNowID, "TASK") {
+		tableName = "sn_compliance_task"
+	} else if strings.HasPrefix(serviceNowID, "TEST") {
+		tableName = "sn_policy_control_test"
+	} else if strings.HasPrefix(serviceNowID, "AUDIT") {
+		tableName = "sn_audit_finding"
+	} else if strings.HasPrefix(serviceNowID, "VR") {
+		tableName = "sn_vendor_risk"
+	} else if strings.HasPrefix(serviceNowID, "REG") {
+		tableName = "sn_regulatory_change"
+	} else {
+		// Default table if we can't determine from the ID
+		tableName = "sn_risk_risk"
+	}
+
+	// Prepare the update payload
+	updateData := map[string]interface{}{
+		"status":        snStatus,
+		"updated_on":    time.Now().Format(time.RFC3339),
+		"update_source": "jira",
+	}
+
+	jsonData, _ := json.Marshal(updateData)
+
+	// Make the API call to update the ServiceNow item
+	endpointURL := fmt.Sprintf("http://localhost:3000/api/now/table/%s/%s", tableName, serviceNowID)
+
+	req, err := http.NewRequest("PATCH", endpointURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Printf("[JIRA MOCK] Error creating ServiceNow update request: %v", err)
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[JIRA MOCK] Error sending status update to ServiceNow: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Log the response
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		log.Printf("[JIRA MOCK] Successfully updated ServiceNow item %s status to %s",
+			serviceNowID, snStatus)
+	} else {
+		log.Printf("[JIRA MOCK] Failed to update ServiceNow item %s. Status: %d, Response: %s",
+			serviceNowID, resp.StatusCode, string(respBody))
+	}
+
+	// Add to webhook log
+	logEntry := map[string]interface{}{
+		"timestamp": time.Now().Format(time.RFC3339),
+		"type":      "outgoing",
+		"target":    "servicenow",
+		"action":    "update_status",
+		"item_id":   serviceNowID,
+		"changes":   fmt.Sprintf("Status: %s → %s", previousStatus, newStatus),
+	}
+	MockDatabase.WebhookLog = append(MockDatabase.WebhookLog, logEntry)
+}
+
+func testServiceNowConnectivity(w http.ResponseWriter, r *http.Request) {
+	// If invoked as a handler, set up response
+	if w != nil && r != nil {
+		w.Header().Set("Content-Type", "application/json")
+	}
+
+	// Create a test request to ServiceNow
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest("GET", "http://localhost:3000/api/status", nil)
+	if err != nil {
+		log.Printf("[JIRA MOCK] Error creating ServiceNow connectivity test request: %v", err)
+
+		if w != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":  "error",
+				"message": fmt.Sprintf("Error creating request: %v", err),
+			})
+		}
+		return
+	}
+
+	// Send the request
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[JIRA MOCK] ServiceNow connectivity test failed: %v", err)
+
+		if w != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":  "error",
+				"message": fmt.Sprintf("Connection failed: %v", err),
+			})
+		}
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read and log response
+	body, _ := io.ReadAll(resp.Body)
+	log.Printf("[JIRA MOCK] ServiceNow connectivity test result: %d, %s", resp.StatusCode, string(body))
+
+	if w != nil {
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":  "success",
+				"message": "Successfully connected to ServiceNow",
+			})
+		} else {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":  "error",
+				"message": fmt.Sprintf("ServiceNow returned status %d", resp.StatusCode),
+			})
+		}
+	}
+}
+
+func addCommentToServiceNow(serviceNowID string, body string, author string) {
+	// Determine the ServiceNow table from the ID format
+	var tableName string
+	if strings.HasPrefix(serviceNowID, "RISK") {
+		tableName = "sn_risk_risk"
+	} else if strings.HasPrefix(serviceNowID, "INC") {
+		tableName = "sn_si_incident"
+	} else if strings.HasPrefix(serviceNowID, "TASK") {
+		tableName = "sn_compliance_task"
+	} else if strings.HasPrefix(serviceNowID, "TEST") {
+		tableName = "sn_policy_control_test"
+	} else if strings.HasPrefix(serviceNowID, "AUDIT") {
+		tableName = "sn_audit_finding"
+	} else if strings.HasPrefix(serviceNowID, "VR") {
+		tableName = "sn_vendor_risk"
+	} else if strings.HasPrefix(serviceNowID, "REG") {
+		tableName = "sn_regulatory_change"
+	} else {
+		// Default table if we can't determine from the ID
+		tableName = "sn_risk_risk"
+	}
+
+	// Prepare the comment payload - for simplicity, we'll just update the record with a comments field
+	updateData := map[string]interface{}{
+		"comments":      fmt.Sprintf("[JIRA Comment from %s] %s", author, body),
+		"updated_on":    time.Now().Format(time.RFC3339),
+		"update_source": "jira",
+	}
+
+	jsonData, _ := json.Marshal(updateData)
+
+	// Make the API call to update the ServiceNow item
+	endpointURL := fmt.Sprintf("http://localhost:3000/api/now/table/%s/%s", tableName, serviceNowID)
+
+	req, err := http.NewRequest("PATCH", endpointURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Printf("[JIRA MOCK] Error creating ServiceNow comment request: %v", err)
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[JIRA MOCK] Error sending comment to ServiceNow: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Log the response
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		log.Printf("[JIRA MOCK] Successfully added comment to ServiceNow item %s",
+			serviceNowID)
+	} else {
+		log.Printf("[JIRA MOCK] Failed to add comment to ServiceNow item %s. Status: %d, Response: %s",
+			serviceNowID, resp.StatusCode, string(respBody))
+	}
+
+	// Add to webhook log
+	logEntry := map[string]interface{}{
+		"timestamp": time.Now().Format(time.RFC3339),
+		"type":      "outgoing",
+		"target":    "servicenow",
+		"action":    "add_comment",
+		"item_id":   serviceNowID,
+		"author":    author,
+	}
+	MockDatabase.WebhookLog = append(MockDatabase.WebhookLog, logEntry)
 }
 
 func handleUI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte(`
+	html := `
         <!DOCTYPE html>
         <html lang="en">
         <head>
@@ -739,6 +1768,17 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                 .alert { padding: 10px; margin-bottom: 15px; border-radius: 4px; display: none; }
                 .alert-success { background-color: #e3fcef; border: 1px solid #36b37e; color: #006644; }
                 .alert-error { background-color: #ffebe6; border: 1px solid #ff5630; color: #de350b; }
+                .refresh-btn { margin-left: 10px; }
+                .project-list { list-style: none; padding: 0; }
+                .project-item { background-color: white; border-left: 4px solid #0052cc; border-radius: 3px; padding: 15px; margin-bottom: 10px; box-shadow: 0 1px 2px rgba(0,0,0,0.1); cursor: pointer; }
+                .project-item:hover { background-color: #f8f9fa; }
+                .project-header { font-weight: bold; color: #0052cc; font-size: 16px; }
+                .project-tickets { padding: 10px; }
+                .project-tickets table { width: 100%; border-collapse: collapse; }
+                .project-tickets th, .project-tickets td { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }
+                .project-tickets th { background-color: #f2f2f2; }
+                .ticket-row { cursor: pointer; }
+                .ticket-row:hover { background-color: #f5f5f5; }
             </style>
         </head>
         <body>
@@ -751,6 +1791,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                 
                 <div class="tabs">
                     <div class="tab active" data-tab="tickets">Tickets</div>
+                    <div class="tab" data-tab="projects">Projects</div>
                     <div class="tab" data-tab="create">Create Ticket</div>
                     <div class="tab" data-tab="webhooks">Webhooks</div>
                     <div class="tab" data-tab="admin">Admin</div>
@@ -758,7 +1799,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                 
                 <div id="tickets" class="tab-content active">
                     <div class="card">
-                        <h2>Search Tickets</h2>
+                        <h2>Search Tickets <button id="refreshTickets" class="refresh-btn">Refresh</button></h2>
                         <div class="form-group">
                             <input type="text" id="searchInput" placeholder="Search by key, summary, or description">
                             <button id="searchButton">Search</button>
@@ -780,6 +1821,25 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                                 <h2>Ticket Details</h2>
                                 <div id="ticketDetail">
                                     <p>Select a ticket to view details</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div id="projects" class="tab-content">
+                    <div class="card">
+                        <h2>Jira Projects</h2>
+                        <div class="row">
+                            <div class="col">
+                                <div id="project-list" class="project-list">
+                                    <!-- Projects will be loaded here -->
+                                </div>
+                            </div>
+                            <div class="col">
+                                <div id="project-tickets" class="project-tickets">
+                                    <h3>Project Tickets</h3>
+                                    <p>Select a project to view tickets</p>
                                 </div>
                             </div>
                         </div>
@@ -873,7 +1933,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                     </div>
                     
                     <div class="card">
-                        <h3>Webhook Event Log</h3>
+                        <h3>Webhook Event Log <button id="refreshWebhookLog" class="refresh-btn">Refresh</button></h3>
                         <div id="webhookLog" class="webhook-log">
                             <!-- Webhook logs will be displayed here -->
                         </div>
@@ -887,8 +1947,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                             <label>Database Management</label>
                             <div>
                                 <button id="resetDatabase">Reset Database</button>
-                                <button id="importData">Import Data</button>
-                                <button id="exportData">Export Data</button>
+                                <button id="testServicenow">Test ServiceNow Connection</button>
                             </div>
                         </div>
                         <div class="form-group">
@@ -911,7 +1970,9 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                     searchInput: document.getElementById('searchInput'),
                     searchButton: document.getElementById('searchButton'),
                     createTicketForm: document.getElementById('createTicketForm'),
-                    webhookLog: document.getElementById('webhookLog')
+                    webhookLog: document.getElementById('webhookLog'),
+                    refreshTickets: document.getElementById('refreshTickets'),
+                    refreshWebhookLog: document.getElementById('refreshWebhookLog')
                 };
 
                 // Utility functions
@@ -920,9 +1981,21 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                         const alert = document.createElement('div');
                         alert.className = 'alert alert-' + type;
                         alert.textContent = message;
-                        dom.alertContainer.appendChild(alert);
                         alert.style.display = 'block';
-                        setTimeout(() => alert.remove(), 5000);
+                        
+                        dom.alertContainer.innerHTML = '';
+                        dom.alertContainer.appendChild(alert);
+                        
+                        setTimeout(() => {
+                            if (dom.alertContainer.contains(alert)) {
+                                alert.style.display = 'none';
+                                setTimeout(() => {
+                                    if (dom.alertContainer.contains(alert)) {
+                                        dom.alertContainer.removeChild(alert);
+                                    }
+                                }, 300);
+                            }
+                        }, 5000);
                     },
                     formatDate: function(dateString) {
                         return !dateString ? '' : new Date(dateString).toLocaleString();
@@ -961,8 +2034,61 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                             });
                             utils.showAlert('Webhook triggered successfully');
                             utils.logWebhookEvent(eventType.replace("_", " ") + " webhook sent for issue " + data.issue_key);
+                            this.getWebhookLogs();
                         } catch (error) {
                             utils.showAlert("Failed to trigger webhook: " + error.message, "error");
+                        }
+                    },
+                    getWebhookLogs: async function() {
+                        try {
+                            const logs = await api.fetch('/api/webhook_logs');
+                            dom.webhookLog.innerHTML = '';
+                            
+                            if (!logs.logs || logs.logs.length === 0) {
+                                dom.webhookLog.innerHTML = '<div class="log-entry">No logs found</div>';
+                                return;
+                            }
+                            
+                            logs.logs.forEach(log => {
+                                const entry = document.createElement('div');
+                                entry.className = 'log-entry';
+                                
+                                // Format based on log type
+                                let logText = '[' + new Date(log.timestamp).toLocaleTimeString() + '] ';
+                                
+                                if (log.type === 'incoming') {
+                                    logText += 'RECEIVED: ';
+                                    if (log.source === 'servicenow') {
+                                        logText += 'ServiceNow ' + log.action + ' for ' + log.table + ' ID:' + log.sys_id;
+                                    } else {
+                                        logText += 'External webhook';
+                                    }
+                                } else {
+                                    logText += 'SENT: ';
+                                    if (log.target === 'servicenow') {
+                                        logText += 'ServiceNow ' + log.action + ' for item ' + log.item_id;
+                                    } else {
+                                        logText += log.event + ' webhook for issue ' + log.issue_key;
+                                    }
+                                }
+                                
+                                entry.textContent = logText;
+                                dom.webhookLog.appendChild(entry);
+                            });
+                        } catch (error) {
+                            utils.showAlert("Failed to load webhook logs: " + error.message, "error");
+                        }
+                    },
+                    testServiceNowConnection: async function() {
+                        try {
+                            const result = await api.fetch('/test_servicenow_connectivity');
+                            if (result.status === 'success') {
+                                utils.showAlert('Successfully connected to ServiceNow');
+                            } else {
+                                utils.showAlert('Failed to connect to ServiceNow: ' + result.message, 'error');
+                            }
+                        } catch (error) {
+                            utils.showAlert('Failed to test ServiceNow connection: ' + error.message, 'error');
                         }
                     }
                 };
@@ -974,7 +2100,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                             const tickets = await api.fetch('/rest/api/2/issue');
                             dom.ticketList.innerHTML = '';
                             
-                            if (tickets.length === 0) {
+                            if (!tickets || tickets.length === 0) {
                                 dom.ticketList.innerHTML = '<li>No tickets found</li>';
                                 return;
                             }
@@ -1034,6 +2160,8 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                             if (ticket.dueDate) {
                                 html += '<br><strong>Due Date:</strong> ' + ticket.dueDate;
                             }
+                            
+                            // Special handling for ServiceNow ID
                             if (ticket.fields && ticket.fields.customfield_servicenow_id) {
                                 html += '<br><strong>ServiceNow ID:</strong> ' + ticket.fields.customfield_servicenow_id;
                             }
@@ -1046,20 +2174,20 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                             }
                             
                             // Transitions
-                            if (transitionsData.transitions && transitionsData.transitions.length > 0) {
+                            if (transitionsData && transitionsData.transitions && transitionsData.transitions.length > 0) {
                                 html += '<div class="ticket-detail"><h4>Actions</h4><div>';
                                 
                                 transitionsData.transitions.forEach(transition => {
                                     html += '<button class="transition-btn" data-transition-id="' + transition.id + '" ' +
                                            'data-ticket-key="' + key + '" data-current-status="' + ticket.status + '" ' +
-                                           'data-new-status="' + transition.name + '">' + transition.name + '</button>';
+                                           'data-new-status="' + transition.to.name + '">' + transition.name + '</button>';
                                 });
                                 
                                 html += '</div></div>';
                             }
                             
                             // Comments
-                            if (commentsData.comments && commentsData.comments.length > 0) {
+                            if (commentsData && commentsData.comments && commentsData.comments.length > 0) {
                                 html += '<div class="ticket-detail"><h4>Comments</h4><div>';
                                 
                                 commentsData.comments.forEach(comment => {
@@ -1172,7 +2300,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                             return;
                         }
                         
-                        const jql = 'project=AUDIT AND summary ~ "' + searchTerm + '"';
+                        const jql = 'summary ~ "' + searchTerm + '"';
                         
                         try {
                             const data = await api.fetch("/rest/api/2/search?jql=" + encodeURIComponent(jql));
@@ -1184,15 +2312,15 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                             }
                             
                             data.issues.forEach(ticket => {
-                                const statusClass = 'status-' + ticket.status.toLowerCase().replace(/ /g, '-');
+                                const statusClass = 'status-' + ticket.fields.status.name.toLowerCase().replace(/ /g, '-');
                                 const li = document.createElement('li');
                                 li.className = 'ticket-item';
                                 li.innerHTML = 
                                     '<div class="ticket-header">' +
                                     '<span class="ticket-key">' + ticket.key + '</span>' +
-                                    '<span class="ticket-status ' + statusClass + '">' + ticket.status + '</span>' +
+                                    '<span class="ticket-status ' + statusClass + '">' + ticket.fields.status.name + '</span>' +
                                     '</div>' +
-                                    '<div>' + ticket.summary + '</div>';
+                                    '<div>' + ticket.fields.summary + '</div>';
                                 
                                 li.addEventListener('click', () => this.loadTicketDetails(ticket.key));
                                 dom.ticketList.appendChild(li);
@@ -1220,6 +2348,12 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                         try {
                             const requestBody = {
                                 fields: {
+                                    project: {
+                                        key: "AUDIT"
+                                    },
+                                    issuetype: {
+                                        name: "Task"
+                                    },
                                     summary,
                                     description,
                                     priority: {name: priority}
@@ -1266,6 +2400,12 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                         // Create ticket
                         dom.createTicketForm.addEventListener('submit', e => this.handleCreateTicket(e));
                         
+                        // Refresh buttons
+                        dom.refreshTickets.addEventListener('click', () => this.loadTickets());
+                        if (dom.refreshWebhookLog) {
+                            dom.refreshWebhookLog.addEventListener('click', () => api.getWebhookLogs());
+                        }
+                        
                         // Webhook buttons
                         document.querySelectorAll('.webhook-btn').forEach(btn => {
                             btn.addEventListener('click', e => {
@@ -1307,114 +2447,186 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                             });
                         }
                         
-                        // Export data
-                        const exportDataBtn = document.getElementById('exportData');
-                        if (exportDataBtn) {
-                            exportDataBtn.addEventListener('click', () => {
-                                api.fetch('/export')
-                                    .then(data => {
-                                        const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
-                                        const url = URL.createObjectURL(blob);
-                                        const a = document.createElement('a');
-                                        a.href = url;
-                                        const now = new Date();
-                                        a.download = "jira_data_export_" + now.getFullYear() + "-" + 
-                                                   String(now.getMonth() + 1).padStart(2, '0') + "-" + 
-                                                   String(now.getDate()).padStart(2, '0') + ".json";
-                                        document.body.appendChild(a);
-                                        a.click();
-                                        document.body.removeChild(a);
-                                        URL.revokeObjectURL(url);
-                                        utils.showAlert('Data exported successfully');
-                                    })
-                                    .catch(error => {
-                                        utils.showAlert("Failed to export data: " + error.message, "error");
-                                    });
+                        // ServiceNow test button
+                        const testServicenowBtn = document.getElementById('testServicenow');
+                        if (testServicenowBtn) {
+                            testServicenowBtn.addEventListener('click', () => {
+                                api.testServiceNowConnection();
                             });
                         }
                         
-                        // Import data
-document.getElementById('importData')?.addEventListener('click', () => {
-    const fileInput = document.createElement('input');
-    fileInput.type = 'file';
-    fileInput.accept = 'application/json';
-    
-    fileInput.addEventListener('change', e => {
-        const file = e.target.files[0];
-        if (!file) return;
-        
-        const reader = new FileReader();
-        reader.onload = event => {
-            try {
-                const data = JSON.parse(event.target.result);
-                
-                api.fetch('/import', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(data)
-                })
-                .then(() => {
-                    utils.showAlert('Data imported successfully');
-                    this.loadTickets();
-                })
-                .catch(error => {
-                    utils.showAlert(fmt.Sprintf("Failed to import data: %s", error.Error()), "error")
-                });
-            } catch (error) {
-                utils.showAlert('Invalid JSON file', 'error');
-            }
-        };
-        reader.readAsText(file);
-    });
-    
-    fileInput.click();
-});
-
-// Tab navigation
-document.querySelectorAll('.tab').forEach(tab => {
-    tab.addEventListener('click', () => {
-        const tabId = tab.getAttribute('data-tab');
-        
-        // Update active tab
-        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-        tab.classList.add('active');
-        
-        // Update active tab content
-        document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
-        document.getElementById(tabId).classList.add('active');
-    });
-});
-
-// Check server status
-this.checkServerStatus();
-},
-
-async checkServerStatus() {
-    const statusElement = document.getElementById('serverStatus');
-    try {
-    const response = await fetch(fmt.Sprintf("%s/health", API_BASE_URL));
-    const data = await response.json();
-    statusElement.textContent = fmt.Sprintf("Server running - Version: %s | DB Status: %s", data.version, data.database);
-}
-    catch (error) {
-        statusElement.textContent = 'Server Error - Unable to connect';
-        statusElement.style.color = 'red';
-    }
-},
-
-init() {
-    this.setupEventListeners();
-    this.loadTickets();
-}
-};
-
-// Initialize the application
-document.addEventListener('DOMContentLoaded', () => {
-    app.init();
-});
+                        // Tab navigation
+                        document.querySelectorAll('.tab').forEach(tab => {
+                            tab.addEventListener('click', () => {
+                                const tabId = tab.getAttribute('data-tab');
+                                
+                                // Update active tab
+                                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                                tab.classList.add('active');
+                                
+                                // Update active tab content
+                                document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+                                document.getElementById(tabId).classList.add('active');
+                                
+                                // Load data for the tab if needed
+                                if (tabId === 'webhooks') {
+                                    api.getWebhookLogs();
+                                } else if (tabId === 'projects') {
+                                    loadProjects();
+                                }
+                            });
+                        });
+                    },
+                    
+                    checkServerStatus() {
+                        const statusElement = document.getElementById('serverStatus');
+                        try {
+                            fetch(API_BASE_URL + '/health')
+                                .then(response => response.json())
+                                .then(data => {
+                                    statusElement.textContent = "Server running - Version: " + data.version + " | DB Status: " + data.database;
+                                })
+                                .catch(error => {
+                                    statusElement.textContent = 'Server Error - Unable to connect';
+                                    statusElement.style.color = 'red';
+                                });
+                        } catch (error) {
+                            statusElement.textContent = 'Server Error - Unable to connect';
+                            statusElement.style.color = 'red';
+                        }
+                    },
+                    
+                    init() {
+                        this.setupEventListeners();
+                        this.loadTickets();
+                        this.checkServerStatus();
                         
-</script>
-</body>
-</html>
-`)) 
+                        // Load projects on init
+                        if (document.getElementById('project-list')) {
+                            loadProjects();
+                        }
+                        
+                        // Auto-check for webhooks log on init
+                        if (document.getElementById('webhookLog')) {
+                            api.getWebhookLogs();
+                        }
+                    }
+                };
+                
+                // Projects functionality
+                function loadProjects() {
+                    fetch('/rest/api/2/project')
+                        .then(response => response.json())
+                        .then(projects => {
+                            const projectList = document.getElementById('project-list');
+                            projectList.innerHTML = '';
+                            
+                            projects.forEach(project => {
+                                const div = document.createElement('div');
+                                div.className = 'project-item';
+                                div.innerHTML = "<div class=\"project-header\">" + project.key + " - " + project.name + "</div>";
+                                div.setAttribute('data-project-key', project.key);
+                                
+                                div.addEventListener('click', function() {
+                                    const projectKey = this.getAttribute('data-project-key');
+                                    loadProjectTickets(projectKey);
+                                    
+                                    // Highlight the selected project
+                                    document.querySelectorAll('.project-item').forEach(item => {
+                                        item.style.backgroundColor = '';
+                                    });
+                                    this.style.backgroundColor = '#e3f2fd';
+                                });
+                                
+                                projectList.appendChild(div);
+                            });
+                        })
+                        .catch(error => {
+                            console.error('Error loading projects:', error);
+                            document.getElementById('project-list').innerHTML = '<div>Error loading projects</div>';
+                        });
+                }
+
+                function loadProjectTickets(projectKey) {
+    const projectTicketsContainer = document.getElementById('project-tickets');
+    projectTicketsContainer.innerHTML = "<h3>" + projectKey + " Tickets</h3><div>Loading tickets...</div>";
+    
+    // Fix: Remove fmt.Sprintf and use proper URL construction
+    fetch("/rest/api/2/search?jql=project=" + encodeURIComponent(projectKey))
+        .then(response => response.json())
+        .then(data => {
+            let html = [
+                "<h3>" + projectKey + " Tickets</h3>",
+                "<table>",
+                "    <thead>",
+                "        <tr>",
+                "            <th>Key</th>",
+                "            <th>Summary</th>",
+                "            <th>Status</th>",
+                "            <th>Created</th>",
+                "        </tr>",
+                "    </thead>",
+                "    <tbody>"
+            ].join("\n");
+            
+            if (data.issues && data.issues.length > 0) {
+                data.issues.forEach(issue => {
+                    html += [
+                        "<tr class='ticket-row' data-ticket-key='" + issue.key + "'>",
+                        "    <td>" + issue.key + "</td>",
+                        "    <td>" + issue.fields.summary + "</td>",
+                        "    <td>" + issue.fields.status.name + "</td>",
+                        "    <td>" + new Date(issue.fields.created).toLocaleDateString() + "</td>",
+                        "</tr>"
+                    ].join("\n");
+                });
+            } else {
+                html += [
+                    "<tr>",
+                    "    <td colspan='4'>No tickets found for this project</td>",
+                    "</tr>"
+                ].join("\n");
+            }
+            
+            html += [
+                "    </tbody>",
+                "</table>"
+            ].join("\n");
+            
+            projectTicketsContainer.innerHTML = html;
+            
+            // Add click event to ticket rows
+            document.querySelectorAll('.ticket-row').forEach(row => {
+                row.addEventListener('click', function() {
+                    const ticketKey = this.getAttribute('data-ticket-key');
+                    
+                    // Switch to tickets tab and load the ticket details
+                    document.querySelector('.tab[data-tab="tickets"]').click();
+                    app.loadTicketDetails(ticketKey);
+                });
+                
+                // Add hover style
+                row.style.cursor = 'pointer';
+                row.addEventListener('mouseover', function() {
+                    this.style.backgroundColor = '#f5f5f5';
+                });
+                row.addEventListener('mouseout', function() {
+                    this.style.backgroundColor = '';
+                });
+            });
+        })
+        .catch(error => {
+            console.error('Error loading project tickets:', error);
+            projectTicketsContainer.innerHTML = "<h3>" + projectKey + " Tickets</h3><div>Error loading tickets</div>";
+        });
+}
+                // Initialize the application
+                document.addEventListener('DOMContentLoaded', () => {
+                    app.init();
+                });
+            </script>
+        </body>
+        </html>
+    `
+	w.Write([]byte(html))
 }
