@@ -1316,7 +1316,7 @@ func triggerWebhook(tableName, sysID, actionType string, data map[string]interfa
 	}
 
 	// Send to Jira
-	resp, err := http.Post("http://localhost:5000/api/webhooks/servicenow", "application/json", bytes.NewBuffer(jsonPayload))
+	resp, err := http.Post("http://host.docker.internal:4000/api/webhooks/servicenow", "application/json", bytes.NewBuffer(jsonPayload))
 	if err != nil {
 		log.Printf("Error sending webhook to Jira for %s/%s: %v", tableName, sysID, err)
 	} else {

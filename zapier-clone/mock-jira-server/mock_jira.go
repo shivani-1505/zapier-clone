@@ -5,36 +5,36 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
+	"math"
 	"net/http"
+	"os"
 	"strings"
 	"time"
-    "os"
-    "io/ioutil"
-    "math"
 
 	"github.com/gorilla/mux"
 )
 
 // JiraTicket represents a Jira issue in our mock system
 type JiraTicket struct {
-    ID          string                 `json:"id"`
-    Key         string                 `json:"key"`
-    Self        string                 `json:"self"`
-    Type        string                 `json:"issuetype"` // Added field for ticket type (Epic, Task, Subtask)
-    Summary     string                 `json:"summary"`
-    Description string                 `json:"description"`
-    Status      string                 `json:"status"`
-    Resolution  string                 `json:"resolution,omitempty"`
-    Priority    string                 `json:"priority,omitempty"`
-    Assignee    string                 `json:"assignee,omitempty"`
-    Created     string                 `json:"created"`
-    Updated     string                 `json:"updated"`
-    DueDate     string                 `json:"dueDate,omitempty"`
-    Labels      []string               `json:"labels,omitempty"`
-    Components  []string               `json:"components,omitempty"`
-    Fields      map[string]interface{} `json:"fields,omitempty"`
-    Comments    []JiraComment          `json:"comments,omitempty"`
+	ID          string                 `json:"id"`
+	Key         string                 `json:"key"`
+	Self        string                 `json:"self"`
+	Type        string                 `json:"issuetype"` // Added field for ticket type (Epic, Task, Subtask)
+	Summary     string                 `json:"summary"`
+	Description string                 `json:"description"`
+	Status      string                 `json:"status"`
+	Resolution  string                 `json:"resolution,omitempty"`
+	Priority    string                 `json:"priority,omitempty"`
+	Assignee    string                 `json:"assignee,omitempty"`
+	Created     string                 `json:"created"`
+	Updated     string                 `json:"updated"`
+	DueDate     string                 `json:"dueDate,omitempty"`
+	Labels      []string               `json:"labels,omitempty"`
+	Components  []string               `json:"components,omitempty"`
+	Fields      map[string]interface{} `json:"fields,omitempty"`
+	Comments    []JiraComment          `json:"comments,omitempty"`
 }
 
 // JiraComment represents a comment on a Jira issue
@@ -146,6 +146,8 @@ func main() {
 	// Webhook receiver for ServiceNow
 	r.HandleFunc("/api/webhooks/servicenow", handleServiceNowWebhook).Methods("POST")
 
+	r.HandleFunc("/test_servicenow_connectivity", testServiceNowConnectivity).Methods("GET")
+
 	// Webhook receiver for Jira
 	r.HandleFunc("/api/webhooks/jira", handleReceiveWebhook).Methods("POST")
 
@@ -171,10 +173,34 @@ func main() {
 		})
 	}).Methods("GET")
 
+	r.HandleFunc("/test_risk_creation", func(w http.ResponseWriter, r *http.Request) {
+		// Create a test ServiceNow webhook payload for a risk
+		payload := ServiceNowWebhookPayload{
+			SysID:      fmt.Sprintf("RISK%d", time.Now().Unix()),
+			TableName:  "sn_risk_risk",
+			ActionType: "insert",
+			Data: map[string]interface{}{
+				"title":       fmt.Sprintf("Test Risk %s", time.Now().Format("15:04:05")),
+				"description": "This is a test risk creation from the mock endpoint",
+				"severity":    "High",
+			},
+		}
+
+		// Process directly (as if received as webhook)
+		createJiraTicketFromServiceNow(payload)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "success",
+			"message": "Test risk creation processed",
+			"details": fmt.Sprintf("Created risk %s", payload.SysID),
+		})
+	}).Methods("GET")
+
 	r.HandleFunc("/", handleUI).Methods("GET")
 
 	// Start server
-	port := "5000"
+	port := "4000"
 	log.Printf("[JIRA MOCK] Starting mock Jira server on port %s...\n", port)
 
 	log.Fatal(http.ListenAndServe(":"+port, r))
@@ -278,17 +304,17 @@ func handleIssues(w http.ResponseWriter, r *http.Request) {
 		// This ensures the variable is used and not just declared
 		// fields["issue_type_stored"] = issueType
 
-        ticketType := r.FormValue("ticketType")
-            if ticketType == "" {
-               ticketType = "Task" // Default to Task if not specified
-        }
+		ticketType := r.FormValue("ticketType")
+		if ticketType == "" {
+			ticketType = "Task" // Default to Task if not specified
+		}
 
 		ticket := JiraTicket{
 			ID:          id,
 			Key:         key,
-			Self:        fmt.Sprintf("http://localhost:5000/rest/api/2/issue/%s", key),
+			Self:        fmt.Sprintf("http://localhost:4000/rest/api/2/issue/%s", key),
 			Type:        ticketType, // Add the ticket type here
-            Summary:     summary,
+			Summary:     summary,
 			Description: description,
 			Status:      "To Do",
 			Priority:    priority,
@@ -560,7 +586,7 @@ func handleTransitions(w http.ResponseWriter, r *http.Request) {
 		case "51": // Any -> Resolved (and remove from ServiceNow)
 			ticket.Status = "Resolved"
 			ticket.Resolution = "Issue Resolved"
-            // Update ServiceNow status to Resolved
+			// Update ServiceNow status to Resolved
 			if ticket.Fields != nil {
 				if snID, ok := ticket.Fields["customfield_servicenow_id"]; ok {
 					if serviceNowID, ok := snID.(string); ok && serviceNowID != "" {
@@ -627,191 +653,190 @@ func handleTransitions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-
 func removeFromServiceNow(serviceNowID string) {
-    if serviceNowID == "" {
-        log.Printf("[ERROR] Cannot remove from ServiceNow: Empty ServiceNow ID")
-        return
-    }
+	if serviceNowID == "" {
+		log.Printf("[ERROR] Cannot remove from ServiceNow: Empty ServiceNow ID")
+		return
+	}
 
-    // Log the action
-    log.Printf("[INFO] Attempting to completely remove record with ServiceNow ID %s from ServiceNow database", serviceNowID)
+	// Log the action
+	log.Printf("[INFO] Attempting to completely remove record with ServiceNow ID %s from ServiceNow database", serviceNowID)
 
-    // Use the GRC_URL environment variable or default to localhost
-    serviceNowURL := os.Getenv("GRC_URL")
-    if serviceNowURL == "" {
-        serviceNowURL = "http://localhost:3000"
-    }
-    
-    // Try multiple possible table names and approaches
-    tables := []string{"risk_task", "rm_risk", "sn_risk_task", "risk_assessment", "task"}
-    
-    // Try deletion with different table names and with/without prefix
-    success := false
-    
-    // First attempt - try with the exact ID as provided across different tables
-    for _, table := range tables {
-        endpoint := fmt.Sprintf("%s/api/now/table/%s/%s", serviceNowURL, table, serviceNowID)
-        if tryServiceNowDeletion(endpoint, fmt.Sprintf("table '%s' with full ID", table)) {
-            success = true
-            break
-        }
-    }
-    
-    // Second attempt - if ID has prefix, try without it across different tables
-    if !success && strings.Contains(serviceNowID, "_") {
-        parts := strings.SplitN(serviceNowID, "_", 2)
-        if len(parts) == 2 {
-            numericID := parts[1]
-            for _, table := range tables {
-                endpoint := fmt.Sprintf("%s/api/now/table/%s/%s", serviceNowURL, table, numericID)
-                if tryServiceNowDeletion(endpoint, fmt.Sprintf("table '%s' with numeric ID", table)) {
-                    success = true
-                    break
-                }
-            }
-        }
-    }
-    
-    // Third attempt - try with the ServiceNow REST API v2 
-    if !success {
-        v2Endpoint := fmt.Sprintf("%s/api/now/v2/table/task?sysparm_query=number=%s", serviceNowURL, serviceNowID)
-        if tryServiceNowQueryAndDelete(v2Endpoint, serviceNowURL) {
-            success = true
-        }
-    }
-    
-    if !success {
-        log.Printf("[CRITICAL ERROR] All attempts to remove the record from ServiceNow database failed for ID: %s", serviceNowID)
-    }
+	// Use the GRC_URL environment variable or default to localhost
+	serviceNowURL := os.Getenv("GRC_URL")
+	if serviceNowURL == "" {
+		serviceNowURL = "http://localhost:3000"
+	}
+
+	// Try multiple possible table names and approaches
+	tables := []string{"risk_task", "rm_risk", "sn_risk_task", "risk_assessment", "task"}
+
+	// Try deletion with different table names and with/without prefix
+	success := false
+
+	// First attempt - try with the exact ID as provided across different tables
+	for _, table := range tables {
+		endpoint := fmt.Sprintf("%s/api/now/table/%s/%s", serviceNowURL, table, serviceNowID)
+		if tryServiceNowDeletion(endpoint, fmt.Sprintf("table '%s' with full ID", table)) {
+			success = true
+			break
+		}
+	}
+
+	// Second attempt - if ID has prefix, try without it across different tables
+	if !success && strings.Contains(serviceNowID, "_") {
+		parts := strings.SplitN(serviceNowID, "_", 2)
+		if len(parts) == 2 {
+			numericID := parts[1]
+			for _, table := range tables {
+				endpoint := fmt.Sprintf("%s/api/now/table/%s/%s", serviceNowURL, table, numericID)
+				if tryServiceNowDeletion(endpoint, fmt.Sprintf("table '%s' with numeric ID", table)) {
+					success = true
+					break
+				}
+			}
+		}
+	}
+
+	// Third attempt - try with the ServiceNow REST API v2
+	if !success {
+		v2Endpoint := fmt.Sprintf("%s/api/now/v2/table/task?sysparm_query=number=%s", serviceNowURL, serviceNowID)
+		if tryServiceNowQueryAndDelete(v2Endpoint, serviceNowURL) {
+			success = true
+		}
+	}
+
+	if !success {
+		log.Printf("[CRITICAL ERROR] All attempts to remove the record from ServiceNow database failed for ID: %s", serviceNowID)
+	}
 }
 
 // Try a single ServiceNow deletion with full error reporting - no authentication
 func tryServiceNowDeletion(endpoint string, attemptDesc string) bool {
-    log.Printf("[ATTEMPT] Trying ServiceNow deletion with %s: %s", attemptDesc, endpoint)
-    
-    req, err := http.NewRequest("DELETE", endpoint, nil)
-    if err != nil {
-        log.Printf("[ERROR] Failed to create DELETE request for %s: %v", attemptDesc, err)
-        return false
-    }
-    
-    req.Header.Set("Content-Type", "application/json")
-    req.Header.Set("Accept", "application/json")
-    
-    // Add a custom header that some ServiceNow instances require
-    req.Header.Set("X-HTTP-Method-Override", "DELETE")
-    
-    // Create HTTP client with increased timeout
-    client := &http.Client{
-        Timeout: 20 * time.Second,
-    }
-    
-    // Execute the request with retry logic
-    maxRetries := 3
-    for i := 0; i < maxRetries; i++ {
-        if i > 0 {
-            // Exponential backoff for retries
-            backoff := time.Duration(math.Pow(2, float64(i))) * time.Second
-            log.Printf("[RETRY] Waiting %v before retry %d for %s", backoff, i+1, attemptDesc)
-            time.Sleep(backoff)
-        }
-        
-        resp, err := client.Do(req)
-        if err != nil {
-            log.Printf("[ERROR] Attempt %d: Failed to execute DELETE request: %v", i+1, err)
-            continue
-        }
-        
-        body, _ := ioutil.ReadAll(resp.Body)
-        resp.Body.Close()
-        
-        // Detailed response logging for debugging
-        log.Printf("[DEBUG] ServiceNow API response - Status: %d, Headers: %v, Body: %s", 
-            resp.StatusCode, resp.Header, string(body))
-        
-        // ServiceNow returns different status codes for successful deletion
-        if resp.StatusCode >= 200 && resp.StatusCode < 300 || resp.StatusCode == 404 {
-            // 200-299: Success, 404: Already deleted
-            log.Printf("[SUCCESS] Successfully removed record from ServiceNow using %s", attemptDesc)
-            return true
-        } else {
-            log.Printf("[ERROR] Attempt %d: Failed to remove record using %s. Status: %d, Response: %s", 
-                i+1, attemptDesc, resp.StatusCode, string(body))
-        }
-    }
-    
-    return false
+	log.Printf("[ATTEMPT] Trying ServiceNow deletion with %s: %s", attemptDesc, endpoint)
+
+	req, err := http.NewRequest("DELETE", endpoint, nil)
+	if err != nil {
+		log.Printf("[ERROR] Failed to create DELETE request for %s: %v", attemptDesc, err)
+		return false
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	// Add a custom header that some ServiceNow instances require
+	req.Header.Set("X-HTTP-Method-Override", "DELETE")
+
+	// Create HTTP client with increased timeout
+	client := &http.Client{
+		Timeout: 20 * time.Second,
+	}
+
+	// Execute the request with retry logic
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		if i > 0 {
+			// Exponential backoff for retries
+			backoff := time.Duration(math.Pow(2, float64(i))) * time.Second
+			log.Printf("[RETRY] Waiting %v before retry %d for %s", backoff, i+1, attemptDesc)
+			time.Sleep(backoff)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("[ERROR] Attempt %d: Failed to execute DELETE request: %v", i+1, err)
+			continue
+		}
+
+		body, _ := ioutil.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		// Detailed response logging for debugging
+		log.Printf("[DEBUG] ServiceNow API response - Status: %d, Headers: %v, Body: %s",
+			resp.StatusCode, resp.Header, string(body))
+
+		// ServiceNow returns different status codes for successful deletion
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 || resp.StatusCode == 404 {
+			// 200-299: Success, 404: Already deleted
+			log.Printf("[SUCCESS] Successfully removed record from ServiceNow using %s", attemptDesc)
+			return true
+		} else {
+			log.Printf("[ERROR] Attempt %d: Failed to remove record using %s. Status: %d, Response: %s",
+				i+1, attemptDesc, resp.StatusCode, string(body))
+		}
+	}
+
+	return false
 }
 
 // Query for the record first, then delete it by sys_id - no authentication
 func tryServiceNowQueryAndDelete(queryEndpoint string, baseURL string) bool {
-    log.Printf("[ATTEMPT] Trying ServiceNow query-then-delete approach: %s", queryEndpoint)
-    
-    req, err := http.NewRequest("GET", queryEndpoint, nil)
-    if err != nil {
-        log.Printf("[ERROR] Failed to create GET query request: %v", err)
-        return false
-    }
-    
-    req.Header.Set("Content-Type", "application/json")
-    req.Header.Set("Accept", "application/json")
-    
-    client := &http.Client{Timeout: 15 * time.Second}
-    resp, err := client.Do(req)
-    if err != nil {
-        log.Printf("[ERROR] Failed to execute GET query request: %v", err)
-        return false
-    }
-    
-    body, _ := ioutil.ReadAll(resp.Body)
-    resp.Body.Close()
-    
-    // Check if we got a successful response
-    if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-        log.Printf("[ERROR] Query failed. Status: %d, Response: %s", resp.StatusCode, string(body))
-        return false
-    }
-    
-    // Parse the response to extract sys_id
-    var result map[string]interface{}
-    if err := json.Unmarshal(body, &result); err != nil {
-        log.Printf("[ERROR] Failed to parse ServiceNow query response: %v", err)
-        return false
-    }
-    
-    // Navigate through the response structure to find the sys_id
-    resultList, ok := result["result"].([]interface{})
-    if !ok || len(resultList) == 0 {
-        log.Printf("[ERROR] No matching records found in ServiceNow")
-        return false
-    }
-    
-    // Process each result and try to delete them
-    for _, item := range resultList {
-        record, ok := item.(map[string]interface{})
-        if !ok {
-            continue
-        }
-        
-        sysID, ok := record["sys_id"].(string)
-        if !ok || sysID == "" {
-            continue
-        }
-        
-        log.Printf("[INFO] Found matching record with sys_id: %s", sysID)
-        
-        // Try to delete using sys_id with different table names
-        tables := []string{"task", "risk_task", "rm_risk"}
-        for _, table := range tables {
-            deleteEndpoint := fmt.Sprintf("%s/api/now/table/%s/%s", baseURL, table, sysID)
-            if tryServiceNowDeletion(deleteEndpoint, fmt.Sprintf("sys_id deletion from '%s'", table)) {
-                return true
-            }
-        }
-    }
-    
-    return false
+	log.Printf("[ATTEMPT] Trying ServiceNow query-then-delete approach: %s", queryEndpoint)
+
+	req, err := http.NewRequest("GET", queryEndpoint, nil)
+	if err != nil {
+		log.Printf("[ERROR] Failed to create GET query request: %v", err)
+		return false
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[ERROR] Failed to execute GET query request: %v", err)
+		return false
+	}
+
+	body, _ := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	// Check if we got a successful response
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("[ERROR] Query failed. Status: %d, Response: %s", resp.StatusCode, string(body))
+		return false
+	}
+
+	// Parse the response to extract sys_id
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		log.Printf("[ERROR] Failed to parse ServiceNow query response: %v", err)
+		return false
+	}
+
+	// Navigate through the response structure to find the sys_id
+	resultList, ok := result["result"].([]interface{})
+	if !ok || len(resultList) == 0 {
+		log.Printf("[ERROR] No matching records found in ServiceNow")
+		return false
+	}
+
+	// Process each result and try to delete them
+	for _, item := range resultList {
+		record, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		sysID, ok := record["sys_id"].(string)
+		if !ok || sysID == "" {
+			continue
+		}
+
+		log.Printf("[INFO] Found matching record with sys_id: %s", sysID)
+
+		// Try to delete using sys_id with different table names
+		tables := []string{"task", "risk_task", "rm_risk"}
+		for _, table := range tables {
+			deleteEndpoint := fmt.Sprintf("%s/api/now/table/%s/%s", baseURL, table, sysID)
+			if tryServiceNowDeletion(deleteEndpoint, fmt.Sprintf("sys_id deletion from '%s'", table)) {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func handleProjects(w http.ResponseWriter, r *http.Request) {
@@ -952,7 +977,21 @@ func handleReceiveWebhook(w http.ResponseWriter, r *http.Request) {
 
 // Complete overhaul of the handleServiceNowWebhook function to fix ServiceNow GRC integration
 func handleServiceNowWebhook(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[JIRA MOCK] Received ServiceNow webhook request: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+	log.Printf("[JIRA MOCK] Headers: %v", r.Header)
+
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	w.Header().Set("Content-Type", "application/json")
+
+	// If the request is OPTIONS, return immediately with a 200 OK (CORS preflight)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	log.Printf("[JIRA MOCK] Received ServiceNow webhook with headers: %v", r.Header)
 
 	// Read and save the request body for debugging
 	requestBody, err := io.ReadAll(r.Body)
@@ -1290,7 +1329,7 @@ func buildIssueWebhookPayload(issueKey string, action string, data map[string]in
 		"issue": map[string]interface{}{
 			"id":     issueKey,
 			"key":    issueKey,
-			"self":   fmt.Sprintf("http://localhost:5000/rest/api/2/issue/%s", issueKey),
+			"self":   fmt.Sprintf("http://localhost:4000/rest/api/2/issue/%s", issueKey),
 			"fields": issueFields,
 		},
 		"user": map[string]interface{}{
@@ -1567,7 +1606,7 @@ func createJiraTicketFromServiceNow(payload ServiceNowWebhookPayload) {
 	log.Printf("[JIRA MOCK] Sending Jira API request: %s", string(jsonBody))
 
 	// Make the API call to create the Jira issue
-	resp, err := http.Post("http://localhost:5000/rest/api/2/issue",
+	resp, err := http.Post("http://localhost:4000/rest/api/2/issue",
 		"application/json", bytes.NewBuffer(jsonBody))
 
 	if err != nil {
@@ -1609,7 +1648,7 @@ func createJiraTicketFromServiceNow(payload ServiceNowWebhookPayload) {
 		ticket := JiraTicket{
 			ID:          id,
 			Key:         key,
-			Self:        fmt.Sprintf("http://localhost:5000/rest/api/2/issue/%s", key),
+			Self:        fmt.Sprintf("http://localhost:4000/rest/api/2/issue/%s", key),
 			Summary:     summary,
 			Description: description,
 			Status:      "To Do",
@@ -2104,52 +2143,86 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                 <div id="create" class="tab-content">
     <div class="card">
         <h2>Create New Ticket</h2>
-        <form id="createTicketForm">
+        <form id="createTicketForm" onsubmit="return false;">
             <div class="form-group">
                 <label for="ticketType">Issue Type</label>
-                <select id="ticketType" required>
+                <select id="ticketType" required onchange="updateFormFields()">
                     <option value="Task">Task</option>
                     <option value="Epic">Epic</option>
                     <option value="Subtask">Subtask</option>
                 </select>
             </div>
+            
+            <!-- Fields for all issue types -->
             <div class="form-group">
                 <label for="summary">Summary</label>
                 <input type="text" id="summary" required>
             </div>
+            
             <div class="form-group">
                 <label for="description">Description</label>
                 <textarea id="description" rows="5"></textarea>
             </div>
-            <div class="row">
-                <div class="col">
-                    <div class="form-group">
-                        <label for="priority">Priority</label>
-                        <select id="priority">
-                            <option value="Highest">Highest</option>
-                            <option value="High">High</option>
-                            <option value="Medium" selected>Medium</option>
-                            <option value="Low">Low</option>
-                            <option value="Lowest">Lowest</option>
-                        </select>
-                    </div>
+            
+            <!-- Epic-specific fields -->
+            <div id="epicFields" class="issue-type-fields" style="display:none;">
+                <div class="form-group">
+                    <label for="epicName">Epic Name</label>
+                    <input type="text" id="epicName">
                 </div>
-                <div class="col">
-                    <div class="form-group">
-                        <label for="dueDate">Due Date</label>
-                        <input type="date" id="dueDate">
-                    </div>
+                <div class="form-group">
+                    <label for="epicColor">Epic Color</label>
+                    <select id="epicColor">
+                        <option value="green">Green</option>
+                        <option value="blue">Blue</option>
+                        <option value="red">Red</option>
+                        <option value="yellow">Yellow</option>
+                        <option value="purple">Purple</option>
+                    </select>
                 </div>
             </div>
-            <div class="form-group">
-                <label for="assignee">Assignee</label>
-                <input type="text" id="assignee" placeholder="Enter assignee name">
+            
+            <!-- Subtask-specific fields -->
+            <div id="subtaskFields" class="issue-type-fields" style="display:none;">
+                <div class="form-group">
+                    <label for="parentIssue">Parent Issue</label>
+                    <input type="text" id="parentIssue" placeholder="Enter parent issue key (e.g., AUDIT-1)">
+                </div>
             </div>
-            <div class="form-group">
-                <label for="serviceNowId">ServiceNow ID</label>
-                <input type="text" id="serviceNowId" placeholder="Enter ServiceNow ID">
+
+            <!-- Common fields that may vary by issue type -->
+            <div id="commonFields">
+                <div class="row">
+                    <div class="col">
+                        <div class="form-group">
+                            <label for="priority">Priority</label>
+                            <select id="priority">
+                                <option value="Highest">Highest</option>
+                                <option value="High">High</option>
+                                <option value="Medium" selected>Medium</option>
+                                <option value="Low">Low</option>
+                                <option value="Lowest">Lowest</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="col">
+                        <div class="form-group">
+                            <label for="dueDate">Due Date</label>
+                            <input type="date" id="dueDate">
+                        </div>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="assignee">Assignee</label>
+                    <input type="text" id="assignee" placeholder="Enter assignee name">
+                </div>
+                <div class="form-group">
+                    <label for="serviceNowId">ServiceNow ID</label>
+                    <input type="text" id="serviceNowId" placeholder="Enter ServiceNow ID">
+                </div>
             </div>
-            <button type="submit">Create Ticket</button>
+            
+            <button type="button" id="createTicketBtn">Create Ticket</button>
         </form>
     </div>
 </div>
@@ -2167,32 +2240,32 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                     </div>
 
                     <div class="card">
-                        <h2>Trigger Webhook Events</h2>
-                        <div class="row">
-                            <div class="col">
-                                <h3>Issue Events</h3>
-                                <div class="form-group">
-                                    <button id="triggerIssueCreated" class="webhook-btn" data-event="issue_created">Issue Created</button>
-                                    <button id="triggerIssueUpdated" class="webhook-btn" data-event="issue_updated">Issue Updated</button>
-                                </div>
-                                <div class="form-group">
-                                    <label for="issueWebhookData">Additional Data (JSON)</label>
-                                    <textarea id="issueWebhookData" rows="5" placeholder='{"summary": "Custom issue summary", "description": "Custom description", "status": "In Progress", "servicenow_id": "INC123456"}'></textarea>
-                                </div>
-                            </div>
-                            <div class="col">
-                                <h3>Comment Events</h3>
-                                <div class="form-group">
-                                    <button id="triggerCommentCreated" class="webhook-btn" data-event="comment_created">Comment Created</button>
-                                    <button id="triggerCommentUpdated" class="webhook-btn" data-event="comment_updated">Comment Updated</button>
-                                </div>
-                                <div class="form-group">
-                                    <label for="commentWebhookData">Comment Data (JSON)</label>
-                                    <textarea id="commentWebhookData" rows="5" placeholder='{"comment": "This is a test comment", "comment_id": "12345"}'></textarea>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
+    					<h2>Trigger Webhook Events</h2>
+    					<div class="row">
+				    	    <div class="col">
+					            <h3>Issue Events</h3>
+            <div class="form-group">
+                <button id="triggerIssueCreated" class="webhook-btn" data-event="issue_created">Issue Created</button>
+                <button id="triggerIssueUpdated" class="webhook-btn" data-event="issue_updated">Issue Updated</button>
+            </div>
+            <div class="form-group">
+                <label for="issueWebhookData">Additional Data (JSON)</label>
+                <textarea id="issueWebhookData" rows="5" placeholder='{"summary": "Custom issue summary", "description": "Custom description", "status": "In Progress", "servicenow_id": "INC123456"}'></textarea>
+            </div>
+        </div>
+        <div class="col">
+            <h3>Comment Events</h3>
+            <div class="form-group">
+                <button id="triggerCommentCreated" class="webhook-btn" data-event="comment_created">Comment Created</button>
+                <button id="triggerCommentUpdated" class="webhook-btn" data-event="comment_updated">Comment Updated</button>
+            </div>
+            <div class="form-group">
+                <label for="commentWebhookData">Comment Data (JSON)</label>
+                <textarea id="commentWebhookData" rows="5" placeholder='{"comment": "This is a test comment", "comment_id": "12345"}'></textarea>
+            </div>
+        </div>
+    </div>
+</div>
                     
                     <div class="card">
                         <h3>Webhook Event Log <button id="refreshWebhookLog" class="refresh-btn">Refresh</button></h3>
@@ -2232,6 +2305,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                     searchInput: document.getElementById('searchInput'),
                     searchButton: document.getElementById('searchButton'),
                     createTicketForm: document.getElementById('createTicketForm'),
+					createTicketBtn: document.getElementById('createTicketBtn'),
                     webhookLog: document.getElementById('webhookLog'),
                     refreshTickets: document.getElementById('refreshTickets'),
                     refreshWebhookLog: document.getElementById('refreshWebhookLog')
@@ -2354,6 +2428,26 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                         }
                     }
                 };
+
+				                function updateFormFields() {
+                    const ticketType = document.getElementById('ticketType').value;
+                    const epicFields = document.getElementById('epicFields');
+                    const subtaskFields = document.getElementById('subtaskFields');
+                    
+                    // Hide all issue-type-specific fields first
+                    document.querySelectorAll('.issue-type-fields').forEach(el => {
+                        el.style.display = 'none';
+                    });
+                    
+                    // Show fields specific to the selected issue type
+                    if (ticketType === 'Epic') {
+                        epicFields.style.display = 'block';
+                        document.getElementById('epicName').required = true;
+                    } else if (ticketType === 'Subtask') {
+                        subtaskFields.style.display = 'block';
+                        document.getElementById('parentIssue').required = true;
+                    }
+                }
 
                 // Core functionality
                 const app = {
@@ -2597,9 +2691,13 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                         }
                     },
                     
+                    // Find the handleCreateTicket method in the app object:
+
                     async handleCreateTicket(e) {
                         e.preventDefault();
+						console.log("Create ticket form submitted");
                         
+                        const ticketType = document.getElementById('ticketType').value;
                         const summary = document.getElementById('summary').value.trim();
                         const description = document.getElementById('description').value.trim();
                         const priority = document.getElementById('priority').value;
@@ -2607,8 +2705,21 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                         const assignee = document.getElementById('assignee').value.trim();
                         const serviceNowId = document.getElementById('serviceNowId').value.trim();
                         
+						console.log("Form values:", { ticketType, summary, description });
+
                         if (!summary) {
                             utils.showAlert('Summary is required', 'error');
+                            return;
+                        }
+                        
+                        // Validate type-specific required fields
+                        if (ticketType === 'Epic' && !document.getElementById('epicName').value.trim()) {
+                            utils.showAlert('Epic Name is required for Epic issue type', 'error');
+                            return;
+                        }
+                        
+                        if (ticketType === 'Subtask' && !document.getElementById('parentIssue').value.trim()) {
+                            utils.showAlert('Parent Issue is required for Subtask issue type', 'error');
                             return;
                         }
                         
@@ -2619,13 +2730,25 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                                         key: "AUDIT"
                                     },
                                     issuetype: {
-                                        name: "Task"
+                                        name: ticketType
                                     },
                                     summary,
                                     description,
                                     priority: {name: priority}
                                 }
                             };
+
+							console.log("Sending request to create ticket:", requestBody);
+                            
+                            // Add type-specific fields
+                            if (ticketType === 'Epic') {
+                                requestBody.fields.epicName = document.getElementById('epicName').value.trim();
+                                requestBody.fields.epicColor = document.getElementById('epicColor').value;
+                            } else if (ticketType === 'Subtask') {
+                                requestBody.fields.parent = {
+                                    key: document.getElementById('parentIssue').value.trim()
+                                };
+                            }
                             
                             if (dueDate) requestBody.fields.duedate = dueDate;
                             if (assignee) requestBody.fields.assignee = {name: assignee};
@@ -2636,15 +2759,29 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                                 headers: {'Content-Type': 'application/json'},
                                 body: JSON.stringify(requestBody)
                             });
+
+							console.log("Ticket created:", result);
                             
-                            // Trigger webhook
-                            api.triggerWebhook('issue_created', {
+                            // Trigger webhook with the appropriate structure based on issue type
+                            const webhookData = {
                                 issue_key: result.key,
                                 summary,
                                 description,
                                 status: "To Do",
-                                servicenow_id: serviceNowId
-                            });
+                                issuetype: ticketType
+                            };
+                            
+                            if (serviceNowId) webhookData.servicenow_id = serviceNowId;
+                            
+                            // Add type-specific fields to webhook payload
+                            if (ticketType === 'Epic') {
+                                webhookData.epicName = document.getElementById('epicName').value.trim();
+                                webhookData.epicColor = document.getElementById('epicColor').value;
+                            } else if (ticketType === 'Subtask') {
+                                webhookData.parent = document.getElementById('parentIssue').value.trim();
+                            }
+                            
+                            api.triggerWebhook('issue_created', webhookData);
                             
                             utils.showAlert("Ticket " + result.key + " created successfully");
                             dom.createTicketForm.reset();
@@ -2653,6 +2790,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                             this.loadTickets();
                             
                         } catch (error) {
+							console.error("Error creating ticket:", error);
                             utils.showAlert("Failed to create ticket: " + error.message, "error");
                         }
                     },
@@ -2664,8 +2802,17 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                             if (e.key === 'Enter') this.handleSearch();
                         });
                         
-                        // Create ticket
-                        dom.createTicketForm.addEventListener('submit', e => this.handleCreateTicket(e));
+                        // Create ticket - use direct button click handler
+const createTicketBtn = document.getElementById('createTicketBtn');
+if (createTicketBtn) {
+    console.log("Found create ticket button, attaching click handler");
+    createTicketBtn.addEventListener('click', e => {
+        console.log("Create ticket button clicked");
+        this.handleCreateTicket(e);
+    });
+} else {
+    console.error('Create ticket button not found');
+}
                         
                         // Refresh buttons
                         dom.refreshTickets.addEventListener('click', () => this.loadTickets());
@@ -2768,6 +2915,9 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                         this.loadTickets();
                         this.checkServerStatus();
                         
+						// Call updateFormFields on init to set initial state
+                        updateFormFields();
+
                         // Load projects on init
                         if (document.getElementById('project-list')) {
                             loadProjects();
