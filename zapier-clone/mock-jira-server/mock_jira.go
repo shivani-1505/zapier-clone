@@ -289,21 +289,6 @@ func handleIssues(w http.ResponseWriter, r *http.Request) {
 			fields["customfield_servicenow_id"] = snID
 		}
 
-		// Either remove the unused variable or use it somewhere
-		// Option 1: Simply remove this code block if not needed
-		/*
-			issueType := "Task"
-			if it, ok := fields["issuetype"].(map[string]interface{}); ok {
-				if name, ok := it["name"].(string); ok {
-					issueType = name
-				}
-			}
-		*/
-
-		// Option 2: If we need to keep track of the issue type, store it in a field
-		// This ensures the variable is used and not just declared
-		// fields["issue_type_stored"] = issueType
-
 		ticketType := r.FormValue("ticketType")
 		if ticketType == "" {
 			ticketType = "Task" // Default to Task if not specified
@@ -328,6 +313,13 @@ func handleIssues(w http.ResponseWriter, r *http.Request) {
 
 		if serviceNowID != "" {
 			MockDatabase.ServiceNowJiraMap[serviceNowID] = key
+		} else {
+			// Generate a ServiceNow ID for Jira-initiated tickets
+			// This ensures new tickets created in Jira get a ServiceNow record
+			serviceNowID = fmt.Sprintf("JIRA-%s-%d", projectKey, time.Now().Unix())
+			fields["customfield_servicenow_id"] = serviceNowID
+			ticket.Fields["customfield_servicenow_id"] = serviceNowID
+			MockDatabase.ServiceNowJiraMap[serviceNowID] = key
 		}
 
 		MockDatabase.Tickets[key] = ticket
@@ -336,11 +328,455 @@ func handleIssues(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[JIRA MOCK] Created issue: %s - %s with ServiceNow ID: %s",
 			key, summary, serviceNowID)
 
+		// IMPORTANT: Create corresponding item in ServiceNow for Jira-initiated tickets
+		go createServiceNowItemFromJira(ticket)
+
 		json.NewEncoder(w).Encode(map[string]string{
 			"id":   id,
 			"key":  key,
 			"self": ticket.Self,
 		})
+		log.Printf("[JIRA MOCK] Created issue: %s - %s with ServiceNow ID: %s",
+			key, summary, serviceNowID)
+
+		// Add this line to send Slack notification
+		go notifySlack(ticket, "created")
+	}
+}
+
+// Add this new function to create ServiceNow items from Jira tickets
+func createServiceNowItemFromJira(ticket JiraTicket) {
+	// Determine if this ticket has a ServiceNow ID from fields
+	serviceNowID := ""
+	if ticket.Fields != nil {
+		if id, ok := ticket.Fields["customfield_servicenow_id"].(string); ok {
+			serviceNowID = id
+		}
+	}
+
+	if serviceNowID == "" {
+		log.Printf("[JIRA MOCK] No ServiceNow ID found for ticket %s, cannot sync", ticket.Key)
+		return
+	}
+
+	/// MODIFIED LOGIC: If ServiceNow ID is user-provided (not auto-generated), we need to update ServiceNow
+	isJiraOriginatedTicket := true // Default to true - assume created in Jira
+
+	// If the ID looks like a real ServiceNow ID pattern, assume it came from ServiceNow
+	if strings.HasPrefix(serviceNowID, "INC") ||
+		strings.HasPrefix(serviceNowID, "RISK") ||
+		strings.HasPrefix(serviceNowID, "AUDIT") ||
+		strings.HasPrefix(serviceNowID, "TASK") {
+		// This appears to be a genuine ServiceNow ID
+		isJiraOriginatedTicket = false
+	}
+
+	// Skip ServiceNow update if this ticket originated from ServiceNow
+	if !isJiraOriginatedTicket {
+		log.Printf("[JIRA MOCK] Skipping ServiceNow update for ticket %s with ID %s - originated from ServiceNow",
+			ticket.Key, serviceNowID)
+		return
+	}
+
+	log.Printf("[JIRA MOCK] Processing Jira-originated ticket %s for ServiceNow update", ticket.Key)
+
+	// Determine the ServiceNow table based on the project key
+	var tableName string
+	switch {
+	case strings.HasPrefix(ticket.Key, "RISK"):
+		tableName = "sn_risk_risk"
+	case strings.HasPrefix(ticket.Key, "INC"):
+		tableName = "sn_si_incident"
+	case strings.HasPrefix(ticket.Key, "COMP"):
+		tableName = "sn_compliance_task"
+	case strings.HasPrefix(ticket.Key, "AUDIT"):
+		tableName = "sn_audit_finding"
+	case strings.HasPrefix(ticket.Key, "VEN"):
+		tableName = "sn_vendor_risk"
+	case strings.HasPrefix(ticket.Key, "REG"):
+		tableName = "sn_regulatory_change"
+	default:
+		tableName = "sn_risk_risk" // Default to risk if no specific mapping
+	}
+
+	// Create the base payload with common fields
+	payload := map[string]interface{}{
+		"title":             ticket.Summary,
+		"short_description": ticket.Summary, // Add this field for ServiceNow compatibility
+		"name":              ticket.Summary, // Add this field for audit records
+		"description":       ticket.Description,
+		"details":           ticket.Description, // Alternative field for description
+		"status":            mapJiraStatusToServiceNow(ticket.Status),
+		"state":             mapJiraStatusToServiceNow(ticket.Status),
+		"jira_key":          ticket.Key,
+		"priority":          mapJiraPriorityToServiceNow(ticket.Priority),
+		"assigned_to":       ticket.Assignee,
+		"owner":             ticket.Assignee, // Add owner field
+		"due_date":          ticket.DueDate,
+		"source":            "jira",
+		"update_time":       time.Now().Format(time.RFC3339),
+		"sync_source":       "jira_initiated",
+		"category":          mapRiskCategory(ticket.Fields),
+		"severity":          mapJiraPriorityToRiskSeverity(ticket.Priority),
+		"likelihood":        "Medium",
+		"impact":            "Medium",
+		"type":              "Operational",
+		"risk_name":         ticket.Summary,
+		"audit_name":        ticket.Summary, // For audit tables
+		"incident_name":     ticket.Summary, // For incident tables
+		"task_name":         ticket.Summary, // For task tables
+	}
+
+	// Add project-specific fields based on the ticket key prefix
+	switch {
+	case strings.HasPrefix(ticket.Key, "AUDIT"):
+		// Audit-specific fields
+		payload["name"] = ticket.Summary // This appears to be the key field for display
+		payload["audit_name"] = ticket.Summary
+		payload["audit_summary"] = ticket.Summary
+		payload["finding_name"] = ticket.Summary
+		payload["finding_title"] = ticket.Summary
+		payload["finding_short_desc"] = ticket.Summary // Add this field
+		payload["audit_details"] = ticket.Description
+		payload["audit_status"] = mapJiraStatusToServiceNow(ticket.Status)
+		payload["finding_status"] = mapJiraStatusToServiceNow(ticket.Status)
+		payload["audit_owner"] = ticket.Assignee
+		payload["audit_type"] = "Standard"
+		payload["audit_classification"] = "Internal" // Add classification
+		payload["finding_classification"] = "Risk"   // Add classification
+		payload["finding_severity"] = mapJiraPriorityToRiskSeverity(ticket.Priority)
+		payload["finding_category"] = mapRiskCategory(ticket.Fields)
+
+		// Log specific fields being sent
+		log.Printf("[JIRA MOCK] AUDIT fields: name=%s, audit_name=%s, finding_name=%s",
+			payload["name"], payload["audit_name"], payload["finding_name"])
+
+	case strings.HasPrefix(ticket.Key, "RISK"):
+		// Risk-specific fields
+		payload["risk_name"] = ticket.Summary
+		payload["risk_title"] = ticket.Summary
+		payload["risk_description"] = ticket.Description
+		payload["risk_category"] = mapRiskCategory(ticket.Fields)
+		payload["risk_severity"] = mapJiraPriorityToRiskSeverity(ticket.Priority)
+		payload["risk_likelihood"] = "Medium"
+		payload["risk_impact"] = "Medium"
+		payload["risk_type"] = "Operational"
+		payload["risk_owner"] = ticket.Assignee
+
+	case strings.HasPrefix(ticket.Key, "INC"):
+		// Incident-specific fields
+		payload["incident_name"] = ticket.Summary
+		payload["incident_title"] = ticket.Summary
+		payload["incident_description"] = ticket.Description
+		payload["incident_status"] = mapJiraStatusToServiceNow(ticket.Status)
+		payload["incident_priority"] = mapJiraPriorityToServiceNow(ticket.Priority)
+		payload["incident_owner"] = ticket.Assignee
+		payload["incident_type"] = "General"
+
+	case strings.HasPrefix(ticket.Key, "COMP"):
+		// Compliance-specific fields
+		payload["task_name"] = ticket.Summary
+		payload["task_description"] = ticket.Description
+		payload["task_state"] = mapJiraStatusToServiceNow(ticket.Status)
+		payload["task_priority"] = mapJiraPriorityToServiceNow(ticket.Priority)
+		payload["task_assigned_to"] = ticket.Assignee
+		payload["task_owner"] = ticket.Assignee
+		payload["compliance_standard"] = "Default"
+
+	case strings.HasPrefix(ticket.Key, "VEN"):
+		// Vendor-specific fields
+		payload["vendor_name"] = ticket.Summary
+		payload["vendor_description"] = ticket.Description
+		payload["vendor_status"] = mapJiraStatusToServiceNow(ticket.Status)
+		payload["vendor_priority"] = mapJiraPriorityToServiceNow(ticket.Priority)
+		payload["contact_person"] = ticket.Assignee
+		payload["vendor_type"] = "Standard"
+
+	case strings.HasPrefix(ticket.Key, "REG"):
+		// Regulatory-specific fields
+		payload["reg_name"] = ticket.Summary
+		payload["reg_title"] = ticket.Summary
+		payload["reg_description"] = ticket.Description
+		payload["reg_status"] = mapJiraStatusToServiceNow(ticket.Status)
+		payload["reg_priority"] = mapJiraPriorityToServiceNow(ticket.Priority)
+		payload["reg_owner"] = ticket.Assignee
+		payload["regulatory_authority"] = "Default"
+	}
+
+	// Add detailed logging to help troubleshoot field mapping
+	log.Printf("[JIRA MOCK] Sending ServiceNow payload for %s with title=%s, name=%s, category=%s",
+		ticket.Key, payload["title"], payload["name"], payload["category"])
+
+	if strings.HasPrefix(ticket.Key, "AUDIT") {
+		log.Printf("[JIRA MOCK] Audit fields: audit_name=%s, finding_name=%s",
+			payload["audit_name"], payload["finding_name"])
+	}
+
+	if ticket.DueDate != "" {
+		payload["due_date"] = ticket.DueDate
+	}
+
+	// Convert to JSON
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("[JIRA MOCK] Error marshalling ServiceNow payload: %v", err)
+		return
+	}
+
+	log.Printf("[JIRA MOCK] Sending update to ServiceNow for item %s with data: %s",
+		serviceNowID, string(jsonPayload))
+
+	// Send to ServiceNow
+	serviceNowURL := os.Getenv("GRC_URL")
+	if serviceNowURL == "" {
+		serviceNowURL = "http://localhost:3000"
+	}
+
+	// Check if this ID already exists in ServiceNow (to determine POST vs PATCH)
+	endpointURL := fmt.Sprintf("%s/api/now/table/%s", serviceNowURL, tableName)
+	method := "POST"
+
+	// If this seems like an update to existing record, use PATCH instead
+	if strings.HasPrefix(serviceNowID, "RISK") || strings.HasPrefix(serviceNowID, "INC") ||
+		strings.HasPrefix(serviceNowID, "TASK") || strings.HasPrefix(serviceNowID, "TEST") ||
+		strings.HasPrefix(serviceNowID, "AUDIT") || strings.HasPrefix(serviceNowID, "VR") ||
+		strings.HasPrefix(serviceNowID, "REG") {
+		endpointURL = fmt.Sprintf("%s/api/now/table/%s/%s", serviceNowURL, tableName, serviceNowID)
+		method = "PATCH"
+	}
+
+	req, err := http.NewRequest(method, endpointURL, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		log.Printf("[JIRA MOCK] Error creating ServiceNow request: %v", err)
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[JIRA MOCK] Error sending update to ServiceNow: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		log.Printf("[JIRA MOCK] Successfully updated ServiceNow item %s. Response: %s",
+			serviceNowID, string(respBody))
+
+		// Add to webhook log
+		logEntry := map[string]interface{}{
+			"timestamp": time.Now().Format(time.RFC3339),
+			"type":      "outgoing",
+			"target":    "servicenow",
+			"action":    "create_or_update",
+			"item_id":   serviceNowID,
+			"source":    "jira",
+			"jira_key":  ticket.Key,
+		}
+		MockDatabase.WebhookLog = append(MockDatabase.WebhookLog, logEntry)
+	} else {
+		log.Printf("[JIRA MOCK] Failed to update ServiceNow item %s. Status: %d, Response: %s",
+			serviceNowID, resp.StatusCode, string(respBody))
+	}
+}
+
+func sendWebhookWithRetry(url string, payload []byte) {
+	maxAttempts := 3
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Post(url, "application/json", bytes.NewBuffer(payload))
+
+		if err != nil {
+			log.Printf("[JIRA MOCK] Webhook attempt %d failed: %v", attempt, err)
+			if attempt < maxAttempts {
+				time.Sleep(time.Duration(attempt) * time.Second)
+				continue
+			}
+			log.Printf("[JIRA MOCK] All webhook attempts failed, giving up: %v", err)
+			return
+		}
+
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			log.Printf("[JIRA MOCK] Webhook sent successfully to %s", url)
+			return
+		}
+
+		log.Printf("[JIRA MOCK] Webhook failed with status %d: %s", resp.StatusCode, string(body))
+		if attempt < maxAttempts {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+	}
+}
+
+func mapJiraPriorityToRiskSeverity(jiraPriority string) string {
+	switch jiraPriority {
+	case "Highest":
+		return "Critical"
+	case "High":
+		return "High"
+	case "Medium":
+		return "Medium"
+	case "Low":
+		return "Low"
+	case "Lowest":
+		return "Very Low"
+	default:
+		return "Medium"
+	}
+}
+
+// Helper function to determine risk category from ticket fields
+func mapRiskCategory(fields map[string]interface{}) string {
+	// First check if there's an explicit risk category field
+	if fields != nil {
+		if category, ok := fields["risk_category"].(string); ok && category != "" {
+			return category
+		}
+
+		// Try to infer from project key
+		if key, ok := fields["key"].(string); ok {
+			if strings.HasPrefix(key, "SEC") {
+				return "Security"
+			} else if strings.HasPrefix(key, "COMP") {
+				return "Compliance"
+			} else if strings.HasPrefix(key, "OPS") {
+				return "Operational"
+			} else if strings.HasPrefix(key, "FIN") {
+				return "Financial"
+			} else if strings.HasPrefix(key, "RISK") {
+				return "Strategic"
+			}
+		}
+	}
+
+	// Default value
+	return "Operational"
+}
+
+// Helper function to map Jira status to ServiceNow status
+func mapJiraStatusToServiceNow(jiraStatus string) string {
+	switch jiraStatus {
+	case "To Do":
+		return "Open"
+	case "In Progress":
+		return "In Progress"
+	case "Done", "Closed":
+		return "Closed"
+	case "Resolved":
+		return "Resolved"
+	default:
+		return jiraStatus
+	}
+}
+
+// Helper function to map Jira priority to ServiceNow priority
+func mapJiraPriorityToServiceNow(jiraPriority string) string {
+	switch jiraPriority {
+	case "Highest":
+		return "Critical"
+	case "High":
+		return "High"
+	case "Medium":
+		return "Medium"
+	case "Low":
+		return "Low"
+	case "Lowest":
+		return "Planning"
+	default:
+		return "Medium"
+	}
+}
+
+// Add this function at the end of your file
+func notifySlack(ticket JiraTicket, action string) {
+	slackWebhookURL := os.Getenv("SLACK_WEBHOOK_URL")
+	if slackWebhookURL == "" {
+		slackWebhookURL = "https://hooks.slack.com/services/YOUR_DEFAULT_WEBHOOK_PATH"
+	}
+
+	// If URL doesn't look like a valid Slack webhook, log and return
+	if !strings.Contains(slackWebhookURL, "hooks.slack.com") {
+		// Try for local development - default to localhost:3000
+		slackWebhookURL = os.Getenv("SLACK_WEBHOOK_URL")
+		if slackWebhookURL == "" {
+			slackWebhookURL = "http://localhost:3000/api/slack/webhook"
+		}
+		log.Printf("[JIRA MOCK] Using development Slack webhook URL: %s", slackWebhookURL)
+	}
+
+	// Format message color based on ticket priority
+	color := "#36a64f" // Default green
+	if strings.ToLower(ticket.Priority) == "high" || strings.ToLower(ticket.Priority) == "highest" {
+		color = "#d00000" // Red for high priority
+	} else if strings.ToLower(ticket.Priority) == "medium" {
+		color = "#ffaa00" // Orange for medium priority
+	}
+
+	// Create message payload
+	payload := map[string]interface{}{
+		"attachments": []map[string]interface{}{
+			{
+				"fallback":   fmt.Sprintf("[%s] %s %s", ticket.Key, action, ticket.Summary),
+				"color":      color,
+				"pretext":    fmt.Sprintf("Jira ticket %s:", action),
+				"title":      fmt.Sprintf("[%s] %s", ticket.Key, ticket.Summary),
+				"title_link": fmt.Sprintf("http://localhost:4000/browse/%s", ticket.Key),
+				"text":       ticket.Description,
+				"fields": []map[string]interface{}{
+					{
+						"title": "Status",
+						"value": ticket.Status,
+						"short": true,
+					},
+					{
+						"title": "Priority",
+						"value": ticket.Priority,
+						"short": true,
+					},
+				},
+				"footer": "Jira Notification",
+				"ts":     time.Now().Unix(),
+			},
+		},
+	}
+
+	// Convert to JSON
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("[JIRA MOCK] Error marshalling Slack payload: %v", err)
+		return
+	}
+
+	// Send to Slack
+	req, err := http.NewRequest("POST", slackWebhookURL, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		log.Printf("[JIRA MOCK] Error creating Slack request: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[JIRA MOCK] Error sending notification to Slack: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		log.Printf("[JIRA MOCK] Successfully sent Slack notification for %s", ticket.Key)
+	} else {
+		respBody, _ := io.ReadAll(resp.Body)
+		log.Printf("[JIRA MOCK] Failed to send Slack notification. Status: %d, Response: %s",
+			resp.StatusCode, string(respBody))
 	}
 }
 
@@ -406,6 +842,7 @@ func handleIssueByKey(w http.ResponseWriter, r *http.Request) {
 
 		log.Printf("[JIRA MOCK] Updated issue: %s to status: %s", key, ticket.Status)
 
+		go notifySlack(ticket, "updated")
 		w.WriteHeader(http.StatusNoContent)
 
 		// Send update back to ServiceNow if this has a ServiceNow ID
@@ -1109,22 +1546,30 @@ func handleServiceNowWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	MockDatabase.WebhookLog = append(MockDatabase.WebhookLog, logEntry)
 
+	// Check if this webhook is for a Jira-initiated update
+	isSyncFromJira := false
+	if syncSource, ok := payload.Data["sync_source"].(string); ok && syncSource == "jira_initiated" {
+		isSyncFromJira = true
+		log.Printf("[JIRA MOCK] Received ServiceNow webhook for a Jira-initiated update, will not create/update ticket")
+	}
+
 	// Handle based on the action type
 	switch payload.ActionType {
 	case "insert", "created", "create":
-		// Always create a ticket for GRC items, regardless of mapping
-		createJiraTicketFromServiceNow(payload)
+		// Only create a ticket if not Jira-initiated
+		if !isSyncFromJira {
+			createJiraTicketFromServiceNow(payload)
+		} else {
+			log.Printf("[JIRA MOCK] Skipping ticket creation for ServiceNow item %s - originated from Jira", payload.SysID)
+		}
 
 	case "update", "updated", "modify", "modified":
-		// Find the corresponding Jira ticket and update it
+		// Find the corresponding Jira ticket and update it if not Jira-initiated
 		jiraKey, exists := MockDatabase.ServiceNowJiraMap[payload.SysID]
-		if exists {
+		if exists && !isSyncFromJira {
 			updateJiraTicketFromServiceNow(jiraKey, payload)
 		} else {
-			log.Printf("[JIRA MOCK] No matching Jira ticket found for ServiceNow item %s, creating new ticket",
-				payload.SysID)
-			// If update comes in for an item we don't have, create it
-			createJiraTicketFromServiceNow(payload)
+			log.Printf("[JIRA MOCK] Skipping update for ServiceNow item %s - originated from Jira or no matching ticket", payload.SysID)
 		}
 
 	case "delete", "deleted", "remove", "removed":
@@ -1132,7 +1577,7 @@ func handleServiceNowWebhook(w http.ResponseWriter, r *http.Request) {
 		jiraKey, exists := MockDatabase.ServiceNowJiraMap[payload.SysID]
 		if exists {
 			ticket, ticketExists := MockDatabase.Tickets[jiraKey]
-			if ticketExists {
+			if ticketExists && !isSyncFromJira {
 				// Mark as deleted in Jira but don't actually delete
 				ticket.Status = "Closed"
 				ticket.Resolution = "Won't Fix"
@@ -1146,6 +1591,8 @@ func handleServiceNowWebhook(w http.ResponseWriter, r *http.Request) {
 				MockDatabase.Tickets[jiraKey] = ticket
 
 				log.Printf("[JIRA MOCK] Marked ticket %s as closed due to ServiceNow deletion", jiraKey)
+			} else if isSyncFromJira {
+				log.Printf("[JIRA MOCK] Skipping deletion for ServiceNow item %s - originated from Jira", payload.SysID)
 			}
 		}
 	}
@@ -1262,14 +1709,10 @@ func triggerStatusChangeWebhook(issueKey string, newStatus string, previousStatu
 		},
 	}
 
-	webhookURL := "http://localhost:8081/api/webhooks/jira"
+	webhookURL := "http://localhost:3000/api/webhooks/jira"
 	jsonPayload, _ := json.Marshal(payload)
-	resp, err := http.Post(webhookURL, "application/json", strings.NewReader(string(jsonPayload)))
-	if err != nil {
-		log.Printf("[JIRA MOCK] Error sending status change webhook: %v", err)
-		return
-	}
-	defer resp.Body.Close()
+
+	sendWebhookWithRetry(webhookURL, jsonPayload)
 
 	// Log the outgoing webhook
 	logEntry := map[string]interface{}{
@@ -2025,54 +2468,480 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>Mock Jira UI</title>
             <style>
-                body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f5f7; }
-                .container { max-width: 1200px; margin: 0 auto; }
-                header { background-color: #0052cc; color: white; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
-                h1, h2, h3 { margin: 0; }
-                .card { background-color: white; border-radius: 5px; box-shadow: 0 1px 3px rgba(0,0,0,0.12); padding: 20px; margin-bottom: 20px; }
-                .row { display: flex; flex-wrap: wrap; margin: 0 -10px; }
-                .col { flex: 1; padding: 0 10px; min-width: 300px; }
-                .form-group { margin-bottom: 15px; }
-                label { display: block; margin-bottom: 5px; font-weight: bold; }
-                input, select, textarea { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
-                button { background-color: #0052cc; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; }
-                button:hover { background-color: #0043a6; }
-                .ticket-list { list-style: none; padding: 0; }
-                .ticket-item { background-color: white; border-left: 4px solid #0052cc; border-radius: 3px; padding: 15px; margin-bottom: 10px; box-shadow: 0 1px 2px rgba(0,0,0,0.1); cursor: pointer; }
-                .ticket-item:hover { background-color: #f8f9fa; }
-                .ticket-header { display: flex; justify-content: space-between; margin-bottom: 10px; }
-                .ticket-key { color: #0052cc; font-weight: bold; }
-                .ticket-status { display: inline-block; padding: 3px 8px; border-radius: 10px; font-size: 12px; font-weight: bold; }
-                .status-to-do, .status-open { background-color: #0052cc; color: white; }
-                .status-in-progress, .status-inprogress { background-color: #0065ff; color: white; }
-                .status-resolved { background-color: #36b37e; color: white; }
-                .status-closed, .status-done { background-color: #6b778c; color: white; }
-                .ticket-detail { padding: 10px; border: 1px solid #ddd; border-radius: 4px; margin-top: 15px; }
-                .tabs { display: flex; border-bottom: 1px solid #ddd; margin-bottom: 15px; }
-                .tab { padding: 10px 15px; cursor: pointer; border-bottom: 2px solid transparent; }
-                .tab.active { border-bottom: 2px solid #0052cc; font-weight: bold; }
-                .tab-content { display: none; }
-                .tab-content.active { display: block; }
-                .comment { padding: 10px; border-left: 3px solid #ddd; margin-bottom: 10px; }
-                .comment-author { font-weight: bold; }
-                .comment-date { color: #6b778c; font-size: 12px; }
-                .webhook-log { background-color: #f4f5f7; border: 1px solid #ddd; border-radius: 4px; padding: 10px; height: 300px; overflow-y: auto; font-family: monospace; font-size: 12px; }
-                .log-entry { margin-bottom: 5px; padding: 5px; border-bottom: 1px solid #eee; }
-                .transition-btn { margin-right: 5px; margin-bottom: 5px; }
-                .alert { padding: 10px; margin-bottom: 15px; border-radius: 4px; display: none; }
-                .alert-success { background-color: #e3fcef; border: 1px solid #36b37e; color: #006644; }
-                .alert-error { background-color: #ffebe6; border: 1px solid #ff5630; color: #de350b; }
-                .refresh-btn { margin-left: 10px; }
-                .project-list { list-style: none; padding: 0; }
-                .project-item { background-color: white; border-left: 4px solid #0052cc; border-radius: 3px; padding: 15px; margin-bottom: 10px; box-shadow: 0 1px 2px rgba(0,0,0,0.1); cursor: pointer; }
-                .project-item:hover { background-color: #f8f9fa; }
-                .project-header { font-weight: bold; color: #0052cc; font-size: 16px; }
-                .project-tickets { padding: 10px; }
-                .project-tickets table { width: 100%; border-collapse: collapse; }
-                .project-tickets th, .project-tickets td { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }
-                .project-tickets th { background-color: #f2f2f2; }
-                .ticket-row { cursor: pointer; }
-                .ticket-row:hover { background-color: #f5f5f5; }
+                :root {
+                    --primary: #1976d2;
+                    --primary-dark: #0d47a1;
+                    --primary-light: #e3f2fd;
+                    --text: #37474f;
+                    --text-secondary: #78909c;
+                    --bg: #f5f7fa;
+                    --card-bg: #ffffff;
+                    --border: #e0e4e8;
+                    --success: #2e7d32;
+                    --success-light: #edf7ed;
+                    --error: #d32f2f;
+                    --error-light: #fdecea;
+                    --status-todo: #1976d2;
+                    --status-progress: #7b1fa2;
+                    --status-resolved: #388e3c;
+                    --status-done: #546e7a;
+                    --radius: 6px;
+                    --shadow: 0 2px 6px rgba(0,0,0,0.04);
+                    --shadow-hover: 0 4px 8px rgba(0,0,0,0.08);
+                    --transition: all 0.2s ease;
+                    --header-bg: #0d47a1;
+                }
+                
+                * {
+                    box-sizing: border-box;
+                    margin: 0;
+                    padding: 0;
+                }
+                
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', sans-serif;
+                    line-height: 1.6;
+                    color: var(--text);
+                    background-color: var(--bg);
+                    margin: 0;
+                    padding: 0;
+                }
+                
+                .container {
+                    max-width: 1300px;
+                    margin: 0 auto;
+                    padding: 1.5rem;
+                }
+                
+                header {
+                    background-color: var(--header-bg);
+                    color: white;
+                    padding: 1.25rem;
+                    border-radius: var(--radius);
+                    margin-bottom: 1.5rem;
+                    display: flex;
+                    align-items: center;
+                    box-shadow: var(--shadow);
+                }
+                
+                h1, h2, h3 {
+                    font-weight: 500;
+                    margin-bottom: 0.75rem;
+                    color: var(--text);
+                }
+                
+                h1 {
+                    font-size: 1.5rem;
+                    color: white;
+                    margin-bottom: 0;
+                    letter-spacing: 0.02em;
+                }
+                
+                h2 {
+                    font-size: 1.25rem;
+                    border-bottom: 1px solid var(--border);
+                    padding-bottom: 0.5rem;
+                    margin-bottom: 1rem;
+                }
+                
+                h3 {
+                    font-size: 1.125rem;
+                    font-weight: 600;
+                }
+                
+                .card {
+                    background-color: var(--card-bg);
+                    border-radius: var(--radius);
+                    box-shadow: var(--shadow);
+                    padding: 1.5rem;
+                    margin-bottom: 1.25rem;
+                    border: 1px solid var(--border);
+                    transition: var(--transition);
+                }
+                
+                .card:hover {
+                    box-shadow: var(--shadow-hover);
+                }
+                
+                .row {
+                    display: flex;
+                    flex-wrap: wrap;
+                    margin: 0 -0.75rem;
+                }
+                
+                .col {
+                    flex: 1;
+                    padding: 0 0.75rem;
+                    min-width: 300px;
+                }
+                
+                .form-group {
+                    margin-bottom: 1.25rem;
+                }
+                
+                label {
+                    display: block;
+                    margin-bottom: 0.5rem;
+                    font-weight: 500;
+                    font-size: 0.875rem;
+                    color: var(--text);
+                }
+                
+                input, select, textarea {
+                    width: 100%;
+                    padding: 0.625rem 0.75rem;
+                    border: 1px solid var(--border);
+                    border-radius: var(--radius);
+                    background-color: var(--card-bg);
+                    color: var(--text);
+                    font-family: inherit;
+                    font-size: 0.875rem;
+                    transition: var(--transition);
+                }
+                
+                input:focus, select:focus, textarea:focus {
+                    outline: none;
+                    border-color: var(--primary);
+                    box-shadow: 0 0 0 2px rgba(25,118,210,0.2);
+                }
+                
+                button {
+                    background-color: var(--primary);
+                    color: white;
+                    border: none;
+                    padding: 0.625rem 1rem;
+                    border-radius: var(--radius);
+                    cursor: pointer;
+                    font-size: 0.875rem;
+                    font-weight: 500;
+                    transition: var(--transition);
+                }
+                
+                button:hover {
+                    background-color: var(--primary-dark);
+                    transform: translateY(-1px);
+                }
+                
+                .ticket-list {
+                    list-style: none;
+                    padding: 0;
+                }
+                
+                .ticket-item {
+                    background-color: var(--card-bg);
+                    border-left: 4px solid var(--primary);
+                    border-radius: var(--radius);
+                    padding: 1rem 1.25rem;
+                    margin-bottom: 0.75rem;
+                    box-shadow: var(--shadow);
+                    cursor: pointer;
+                    transition: var(--transition);
+                }
+                
+                .ticket-item:hover {
+                    background-color: var(--primary-light);
+                    transform: translateY(-2px);
+                    box-shadow: var(--shadow-hover);
+                }
+                
+                .ticket-header {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    margin-bottom: 0.625rem;
+                }
+                
+                .ticket-key {
+                    color: var(--primary);
+                    font-weight: 600;
+                    font-size: 0.875rem;
+                    letter-spacing: 0.03em;
+                }
+                
+                .ticket-status {
+                    display: inline-block;
+                    padding: 0.25rem 0.75rem;
+                    border-radius: 12px;
+                    font-size: 0.75rem;
+                    font-weight: 500;
+                    text-transform: uppercase;
+                    letter-spacing: 0.03em;
+                }
+                
+                .status-to-do, .status-open {
+                    background-color: var(--status-todo);
+                    color: white;
+                }
+                
+                .status-in-progress, .status-inprogress {
+                    background-color: var(--status-progress);
+                    color: white;
+                }
+                
+                .status-resolved {
+                    background-color: var(--status-resolved);
+                    color: white;
+                }
+                
+                .status-closed, .status-done {
+                    background-color: var(--status-done);
+                    color: white;
+                }
+                
+                .ticket-detail {
+                    padding: 1.25rem;
+                    border: 1px solid var(--border);
+                    border-radius: var(--radius);
+                    margin-top: 1.25rem;
+                    background-color: var(--card-bg);
+                }
+                
+                .tabs {
+                    display: flex;
+                    border-bottom: 1px solid var(--border);
+                    margin-bottom: 1.5rem;
+                    background-color: var(--card-bg);
+                    border-radius: var(--radius) var(--radius) 0 0;
+                    padding: 0 0.5rem;
+                }
+                
+                .tab {
+                    padding: 0.875rem 1.25rem;
+                    cursor: pointer;
+                    font-weight: 500;
+                    color: var(--text-secondary);
+                    border-bottom: 2px solid transparent;
+                    transition: var(--transition);
+                    position: relative;
+                }
+                
+                .tab:hover {
+                    color: var(--primary);
+                }
+                
+                .tab.active {
+                    color: var(--primary);
+                    border-bottom: 2px solid var(--primary);
+                    font-weight: 600;
+                }
+                
+                .tab-content {
+                    display: none;
+                    animation: fadeIn 0.25s ease;
+                }
+                
+                .tab-content.active {
+                    display: block;
+                }
+                
+                @keyframes fadeIn {
+                    from { opacity: 0; }
+                    to { opacity: 1; }
+                }
+                
+                .comment {
+                    padding: 1rem;
+                    border-left: 3px solid var(--border);
+                    margin-bottom: 1rem;
+                    background-color: var(--bg);
+                    border-radius: var(--radius);
+                }
+                
+                .comment-author {
+                    font-weight: 600;
+                    font-size: 0.875rem;
+                    color: var(--text);
+                    margin-bottom: 0.375rem;
+                }
+                
+                .comment-date {
+                    color: var(--text-secondary);
+                    font-size: 0.75rem;
+                    margin-bottom: 0.75rem;
+                }
+                
+                .webhook-log {
+                    background-color: #f8f9fa;
+                    border: 1px solid var(--border);
+                    border-radius: var(--radius);
+                    padding: 1rem;
+                    height: 300px;
+                    overflow-y: auto;
+                    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+                    font-size: 0.75rem;
+                    line-height: 1.5;
+                }
+                
+                .log-entry {
+                    margin-bottom: 0.5rem;
+                    padding: 0.5rem;
+                    border-bottom: 1px solid #eee;
+                }
+                
+                .transition-btn {
+                    margin-right: 0.75rem;
+                    margin-bottom: 0.75rem;
+                    font-size: 0.8125rem;
+                }
+                
+                .alert {
+                    padding: 0.875rem 1.25rem;
+                    margin-bottom: 1.25rem;
+                    border-radius: var(--radius);
+                    display: none;
+                    animation: slideIn 0.3s ease;
+                }
+                
+                @keyframes slideIn {
+                    from { transform: translateY(-10px); opacity: 0; }
+                    to { transform: translateY(0); opacity: 1; }
+                }
+                
+                .alert-success {
+                    background-color: var(--success-light);
+                    border: 1px solid var(--success);
+                    color: var(--success);
+                }
+                
+                .alert-error {
+                    background-color: var(--error-light);
+                    border: 1px solid var(--error);
+                    color: var(--error);
+                }
+                
+                .refresh-btn {
+                    margin-left: 0.625rem;
+                    padding: 0.375rem 0.75rem;
+                    font-size: 0.75rem;
+                    background-color: var(--text-secondary);
+                }
+                
+                .refresh-btn:hover {
+                    background-color: var(--text);
+                }
+                
+                .project-list {
+                    list-style: none;
+                    padding: 0;
+                }
+                
+                .project-item {
+                    background-color: var(--card-bg);
+                    border-left: 3px solid var(--primary);
+                    border-radius: var(--radius);
+                    padding: 1rem 1.25rem;
+                    margin-bottom: 0.75rem;
+                    box-shadow: var(--shadow);
+                    cursor: pointer;
+                    transition: var(--transition);
+                }
+                
+                .project-item:hover {
+                    transform: translateY(-2px);
+                    background-color: var(--primary-light);
+                    box-shadow: var(--shadow-hover);
+                }
+                
+                .project-header {
+                    font-weight: 500;
+                    color: var(--primary);
+                    font-size: 0.9375rem;
+                }
+                
+                .project-tickets {
+                    padding: 0.75rem 0;
+                }
+                
+                .project-tickets table {
+                    width: 100%;
+                    border-collapse: collapse;
+                    border: 1px solid var(--border);
+                    border-radius: var(--radius);
+                    overflow: hidden;
+                }
+                
+                .project-tickets th, .project-tickets td {
+                    padding: 0.75rem 1rem;
+                    text-align: left;
+                    border-bottom: 1px solid var(--border);
+                    font-size: 0.875rem;
+                }
+                
+                .project-tickets th {
+                    background-color: #f8f9fa;
+                    font-weight: 600;
+                    color: var(--text);
+                    border-bottom: 2px solid var(--border);
+                }
+                
+                .ticket-row {
+                    cursor: pointer;
+                    transition: var(--transition);
+                }
+                
+                .ticket-row:hover {
+                    background-color: var(--primary-light);
+                }
+                
+                #searchButton {
+                    margin-top: 0.5rem;
+                }
+                
+                .search-container {
+                    display: flex;
+                    gap: 0.5rem;
+                    align-items: center;
+                }
+                
+                .search-container input {
+                    flex: 1;
+                }
+                
+                .dashboard-summary {
+                    margin-bottom: 2rem;
+                }
+                
+                .stats-cards {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                    gap: 1rem;
+                    margin-bottom: 2rem;
+                }
+                
+                .stat-card {
+                    background-color: var(--card-bg);
+                    border-radius: var(--radius);
+                    padding: 1.25rem;
+                    text-align: center;
+                    box-shadow: var(--shadow);
+                    border: 1px solid var(--border);
+                }
+                
+                .stat-value {
+                    font-size: 1.75rem;
+                    font-weight: bold;
+                    color: var(--primary);
+                    margin-bottom: 0.5rem;
+                }
+                
+                .stat-label {
+                    font-size: 0.875rem;
+                    color: var(--text-secondary);
+                    text-transform: uppercase;
+                    letter-spacing: 0.05em;
+                }
+                
+                .btn-group {
+                    display: flex;
+                    gap: 0.75rem;
+                }
+                
+                .section-header {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    margin-bottom: 1rem;
+                }
             </style>
         </head>
         <body>
@@ -2092,9 +2961,34 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                 </div>
                 
                 <div id="tickets" class="tab-content active">
+                    <!-- Dashboard stats overview -->
+                    <div class="dashboard-summary">
+                        <div class="stats-cards">
+                            <div class="stat-card">
+                                <div class="stat-value" id="total-tickets">--</div>
+                                <div class="stat-label">Total Tickets</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-value" id="todo-tickets">--</div>
+                                <div class="stat-label">To Do</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-value" id="progress-tickets">--</div>
+                                <div class="stat-label">In Progress</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-value" id="done-tickets">--</div>
+                                <div class="stat-label">Done</div>
+                            </div>
+                        </div>
+                    </div>
+                
                     <div class="card">
-                        <h2>Search Tickets <button id="refreshTickets" class="refresh-btn">Refresh</button></h2>
-                        <div class="form-group">
+                        <div class="section-header">
+                            <h2>Search Tickets</h2>
+                            <button id="refreshTickets" class="refresh-btn">Refresh</button>
+                        </div>
+                        <div class="search-container">
                             <input type="text" id="searchInput" placeholder="Search by key, summary, or description">
                             <button id="searchButton">Search</button>
                         </div>
@@ -2141,91 +3035,103 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                 </div>
                 
                 <div id="create" class="tab-content">
-    <div class="card">
-        <h2>Create New Ticket</h2>
-        <form id="createTicketForm" onsubmit="return false;">
-            <div class="form-group">
-                <label for="ticketType">Issue Type</label>
-                <select id="ticketType" required onchange="updateFormFields()">
-                    <option value="Task">Task</option>
-                    <option value="Epic">Epic</option>
-                    <option value="Subtask">Subtask</option>
-                </select>
-            </div>
-            
-            <!-- Fields for all issue types -->
-            <div class="form-group">
-                <label for="summary">Summary</label>
-                <input type="text" id="summary" required>
-            </div>
-            
-            <div class="form-group">
-                <label for="description">Description</label>
-                <textarea id="description" rows="5"></textarea>
-            </div>
-            
-            <!-- Epic-specific fields -->
-            <div id="epicFields" class="issue-type-fields" style="display:none;">
-                <div class="form-group">
-                    <label for="epicName">Epic Name</label>
-                    <input type="text" id="epicName">
-                </div>
-                <div class="form-group">
-                    <label for="epicColor">Epic Color</label>
-                    <select id="epicColor">
-                        <option value="green">Green</option>
-                        <option value="blue">Blue</option>
-                        <option value="red">Red</option>
-                        <option value="yellow">Yellow</option>
-                        <option value="purple">Purple</option>
-                    </select>
-                </div>
-            </div>
-            
-            <!-- Subtask-specific fields -->
-            <div id="subtaskFields" class="issue-type-fields" style="display:none;">
-                <div class="form-group">
-                    <label for="parentIssue">Parent Issue</label>
-                    <input type="text" id="parentIssue" placeholder="Enter parent issue key (e.g., AUDIT-1)">
-                </div>
-            </div>
+                    <div class="card">
+                        <h2>Create New Ticket</h2>
+                        <form id="createTicketForm" onsubmit="return false;">
+                            <div class="form-group">
+                                <label for="projectKey">Project</label>
+                                <select id="projectKey" required>
+                                    <option value="AUDIT">Audit Management (AUDIT)</option>
+                                    <option value="RISK">Risk Management (RISK)</option>
+                                    <option value="INC">Incident Management (INC)</option>
+                                    <option value="COMP">Compliance Tasks (COMP)</option>
+                                    <option value="VEN">Vendor Risk (VEN)</option>
+                                    <option value="REG">Regulatory Changes (REG)</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="ticketType">Issue Type</label>
+                                <select id="ticketType" required onchange="updateFormFields()">
+                                    <option value="Task">Task</option>
+                                    <option value="Epic">Epic</option>
+                                    <option value="Subtask">Subtask</option>
+                                </select>
+                            </div>
+                            
+                            <!-- Fields for all issue types -->
+                            <div class="form-group">
+                                <label for="summary">Summary</label>
+                                <input type="text" id="summary" required>
+                            </div>
+                            
+                            <div class="form-group">
+                                <label for="description">Description</label>
+                                <textarea id="description" rows="5"></textarea>
+                            </div>
+                            
+                            <!-- Epic-specific fields -->
+                            <div id="epicFields" class="issue-type-fields" style="display:none;">
+                                <div class="form-group">
+                                    <label for="epicName">Epic Name</label>
+                                    <input type="text" id="epicName">
+                                </div>
+                                <div class="form-group">
+                                    <label for="epicColor">Epic Color</label>
+                                    <select id="epicColor">
+                                        <option value="green">Green</option>
+                                        <option value="blue">Blue</option>
+                                        <option value="red">Red</option>
+                                        <option value="yellow">Yellow</option>
+                                        <option value="purple">Purple</option>
+                                    </select>
+                                </div>
+                            </div>
+                            
+                            <!-- Subtask-specific fields -->
+                            <div id="subtaskFields" class="issue-type-fields" style="display:none;">
+                                <div class="form-group">
+                                    <label for="parentIssue">Parent Issue</label>
+                                    <input type="text" id="parentIssue" placeholder="Enter parent issue key (e.g., AUDIT-1)">
+                                </div>
+                            </div>
 
-            <!-- Common fields that may vary by issue type -->
-            <div id="commonFields">
-                <div class="row">
-                    <div class="col">
-                        <div class="form-group">
-                            <label for="priority">Priority</label>
-                            <select id="priority">
-                                <option value="Highest">Highest</option>
-                                <option value="High">High</option>
-                                <option value="Medium" selected>Medium</option>
-                                <option value="Low">Low</option>
-                                <option value="Lowest">Lowest</option>
-                            </select>
-                        </div>
+                            <!-- Common fields that may vary by issue type -->
+                            <div id="commonFields">
+                                <div class="row">
+                                    <div class="col">
+                                        <div class="form-group">
+                                            <label for="priority">Priority</label>
+                                            <select id="priority">
+                                                <option value="Highest">Highest</option>
+                                                <option value="High">High</option>
+                                                <option value="Medium" selected>Medium</option>
+                                                <option value="Low">Low</option>
+                                                <option value="Lowest">Lowest</option>
+                                            </select>
+                                        </div>
+                                    </div>
+                                    <div class="col">
+                                        <div class="form-group">
+                                            <label for="dueDate">Due Date</label>
+                                            <input type="date" id="dueDate">
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <label for="assignee">Assignee</label>
+                                    <input type="text" id="assignee" placeholder="Enter assignee name">
+                                </div>
+                                <div class="form-group">
+                                    <label for="serviceNowId">ServiceNow ID</label>
+                                    <input type="text" id="serviceNowId" placeholder="Enter ServiceNow ID">
+                                </div>
+                            </div>
+                            
+                            <button type="button" id="createTicketBtn">Create Ticket</button>
+                        </form>
                     </div>
-                    <div class="col">
-                        <div class="form-group">
-                            <label for="dueDate">Due Date</label>
-                            <input type="date" id="dueDate">
-                        </div>
-                    </div>
                 </div>
-                <div class="form-group">
-                    <label for="assignee">Assignee</label>
-                    <input type="text" id="assignee" placeholder="Enter assignee name">
-                </div>
-                <div class="form-group">
-                    <label for="serviceNowId">ServiceNow ID</label>
-                    <input type="text" id="serviceNowId" placeholder="Enter ServiceNow ID">
-                </div>
-            </div>
-            
-            <button type="button" id="createTicketBtn">Create Ticket</button>
-        </form>
-    </div>
-</div>
+                
                 <div id="webhooks" class="tab-content">
                     <div class="card">
                         <h2>Webhook Configuration</h2>
@@ -2240,35 +3146,42 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                     </div>
 
                     <div class="card">
-    					<h2>Trigger Webhook Events</h2>
-    					<div class="row">
-				    	    <div class="col">
-					            <h3>Issue Events</h3>
-            <div class="form-group">
-                <button id="triggerIssueCreated" class="webhook-btn" data-event="issue_created">Issue Created</button>
-                <button id="triggerIssueUpdated" class="webhook-btn" data-event="issue_updated">Issue Updated</button>
-            </div>
-            <div class="form-group">
-                <label for="issueWebhookData">Additional Data (JSON)</label>
-                <textarea id="issueWebhookData" rows="5" placeholder='{"summary": "Custom issue summary", "description": "Custom description", "status": "In Progress", "servicenow_id": "INC123456"}'></textarea>
-            </div>
-        </div>
-        <div class="col">
-            <h3>Comment Events</h3>
-            <div class="form-group">
-                <button id="triggerCommentCreated" class="webhook-btn" data-event="comment_created">Comment Created</button>
-                <button id="triggerCommentUpdated" class="webhook-btn" data-event="comment_updated">Comment Updated</button>
-            </div>
-            <div class="form-group">
-                <label for="commentWebhookData">Comment Data (JSON)</label>
-                <textarea id="commentWebhookData" rows="5" placeholder='{"comment": "This is a test comment", "comment_id": "12345"}'></textarea>
-            </div>
-        </div>
-    </div>
-</div>
+                        <h2>Trigger Webhook Events</h2>
+                        <div class="row">
+                            <div class="col">
+                                <h3>Issue Events</h3>
+                                <div class="form-group">
+                                    <div class="btn-group">
+                                        <button id="triggerIssueCreated" class="webhook-btn" data-event="issue_created">Issue Created</button>
+                                        <button id="triggerIssueUpdated" class="webhook-btn" data-event="issue_updated">Issue Updated</button>
+                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <label for="issueWebhookData">Additional Data (JSON)</label>
+                                    <textarea id="issueWebhookData" rows="5" placeholder='{"summary": "Custom issue summary", "description": "Custom description", "status": "In Progress", "servicenow_id": "INC123456"}'></textarea>
+                                </div>
+                            </div>
+                            <div class="col">
+                                <h3>Comment Events</h3>
+                                <div class="form-group">
+                                    <div class="btn-group">
+                                        <button id="triggerCommentCreated" class="webhook-btn" data-event="comment_created">Comment Created</button>
+                                        <button id="triggerCommentUpdated" class="webhook-btn" data-event="comment_updated">Comment Updated</button>
+                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <label for="commentWebhookData">Comment Data (JSON)</label>
+                                    <textarea id="commentWebhookData" rows="5" placeholder='{"comment": "This is a test comment", "comment_id": "12345"}'></textarea>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                     
                     <div class="card">
-                        <h3>Webhook Event Log <button id="refreshWebhookLog" class="refresh-btn">Refresh</button></h3>
+                        <div class="section-header">
+                            <h2>Webhook Event Log</h2>
+                            <button id="refreshWebhookLog" class="refresh-btn">Refresh</button>
+                        </div>
                         <div id="webhookLog" class="webhook-log">
                             <!-- Webhook logs will be displayed here -->
                         </div>
@@ -2280,14 +3193,14 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                         <h2>Admin Tools</h2>
                         <div class="form-group">
                             <label>Database Management</label>
-                            <div>
+                            <div class="btn-group">
                                 <button id="resetDatabase">Reset Database</button>
                                 <button id="testServicenow">Test ServiceNow Connection</button>
                             </div>
                         </div>
                         <div class="form-group">
                             <label>Server Status</label>
-                            <div id="serverStatus">Checking...</div>
+                            <div id="serverStatus" style="padding: 0.75rem; background-color: var(--bg); border-radius: var(--radius);">Checking...</div>
                         </div>
                     </div>
                 </div>
@@ -2305,10 +3218,14 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                     searchInput: document.getElementById('searchInput'),
                     searchButton: document.getElementById('searchButton'),
                     createTicketForm: document.getElementById('createTicketForm'),
-					createTicketBtn: document.getElementById('createTicketBtn'),
+                    createTicketBtn: document.getElementById('createTicketBtn'),
                     webhookLog: document.getElementById('webhookLog'),
                     refreshTickets: document.getElementById('refreshTickets'),
-                    refreshWebhookLog: document.getElementById('refreshWebhookLog')
+                    refreshWebhookLog: document.getElementById('refreshWebhookLog'),
+                    totalTickets: document.getElementById('total-tickets'),
+                    todoTickets: document.getElementById('todo-tickets'),
+                    progressTickets: document.getElementById('progress-tickets'),
+                    doneTickets: document.getElementById('done-tickets')
                 };
 
                 // Utility functions
@@ -2341,6 +3258,27 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                         entry.className = 'log-entry';
                         entry.textContent = '[' + new Date().toLocaleTimeString() + '] ' + message;
                         dom.webhookLog.prepend(entry);
+                    },
+                    updateDashboardStats: function(tickets) {
+                        const total = tickets.length;
+                        let todo = 0;
+                        let inProgress = 0;
+                        let done = 0;
+                        
+                        tickets.forEach(ticket => {
+                            if (ticket.status === 'To Do') {
+                                todo++;
+                            } else if (ticket.status === 'In Progress') {
+                                inProgress++;
+                            } else if (ticket.status === 'Done' || ticket.status === 'Closed' || ticket.status === 'Resolved') {
+                                done++;
+                            }
+                        });
+                        
+                        dom.totalTickets.textContent = total;
+                        dom.todoTickets.textContent = todo;
+                        dom.progressTickets.textContent = inProgress;
+                        dom.doneTickets.textContent = done;
                     }
                 };
 
@@ -2429,7 +3367,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                     }
                 };
 
-				                function updateFormFields() {
+                function updateFormFields() {
                     const ticketType = document.getElementById('ticketType').value;
                     const epicFields = document.getElementById('epicFields');
                     const subtaskFields = document.getElementById('subtaskFields');
@@ -2455,6 +3393,9 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                         try {
                             const tickets = await api.fetch('/rest/api/2/issue');
                             dom.ticketList.innerHTML = '';
+                            
+                            // Update the dashboard stats
+                            utils.updateDashboardStats(tickets);
                             
                             if (!tickets || tickets.length === 0) {
                                 dom.ticketList.innerHTML = '<li>No tickets found</li>';
@@ -2497,8 +3438,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                             ]);
 
                             // Extract issue type from fields
-        const issueType = ticket.fields?.issuetype?.name || "Unknown";
-
+                            const issueType = ticket.fields?.issuetype?.name || "Unknown";
                             
                             // Build detail HTML
                             const statusClass = "status-" + ticket.status.toLowerCase().replace(/ /g, "-");
@@ -2507,7 +3447,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                                 '<h3>' + ticket.summary + '</h3>' +
                                 '<div>' +
                                 '<strong>Key:</strong> ' + ticket.key +
-                                '<br><strong>Type:</strong> ' + issueType + // ✅ Added Issue Type
+                                '<br><strong>Type:</strong> ' + issueType +
                                 '<br><strong>Status:</strong> <span class="ticket-status ' + statusClass + '">' + ticket.status + '</span>' +
                                 '<br><strong>Created:</strong> ' + utils.formatDate(ticket.created) +
                                 '<br><strong>Updated:</strong> ' + utils.formatDate(ticket.updated);
@@ -2536,7 +3476,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                             
                             // Transitions
                             if (transitionsData && transitionsData.transitions && transitionsData.transitions.length > 0) {
-                                html += '<div class="ticket-detail"><h4>Actions</h4><div>';
+                                html += '<div class="ticket-detail"><h4>Actions</h4><div class="btn-group">';
                                 
                                 transitionsData.transitions.forEach(transition => {
                                     html += '<button class="transition-btn" data-transition-id="' + transition.id + '" ' +
@@ -2691,11 +3631,9 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                         }
                     },
                     
-                    // Find the handleCreateTicket method in the app object:
-
                     async handleCreateTicket(e) {
                         e.preventDefault();
-						console.log("Create ticket form submitted");
+                        console.log("Create ticket form submitted");
                         
                         const ticketType = document.getElementById('ticketType').value;
                         const summary = document.getElementById('summary').value.trim();
@@ -2705,7 +3643,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                         const assignee = document.getElementById('assignee').value.trim();
                         const serviceNowId = document.getElementById('serviceNowId').value.trim();
                         
-						console.log("Form values:", { ticketType, summary, description });
+                        console.log("Form values:", { ticketType, summary, description });
 
                         if (!summary) {
                             utils.showAlert('Summary is required', 'error');
@@ -2727,7 +3665,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                             const requestBody = {
                                 fields: {
                                     project: {
-                                        key: "AUDIT"
+                                        key: document.getElementById('projectKey').value // This uses the selected project
                                     },
                                     issuetype: {
                                         name: ticketType
@@ -2738,7 +3676,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                                 }
                             };
 
-							console.log("Sending request to create ticket:", requestBody);
+                            console.log("Sending request to create ticket:", requestBody);
                             
                             // Add type-specific fields
                             if (ticketType === 'Epic') {
@@ -2760,7 +3698,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                                 body: JSON.stringify(requestBody)
                             });
 
-							console.log("Ticket created:", result);
+                            console.log("Ticket created:", result);
                             
                             // Trigger webhook with the appropriate structure based on issue type
                             const webhookData = {
@@ -2790,7 +3728,7 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                             this.loadTickets();
                             
                         } catch (error) {
-							console.error("Error creating ticket:", error);
+                            console.error("Error creating ticket:", error);
                             utils.showAlert("Failed to create ticket: " + error.message, "error");
                         }
                     },
@@ -2803,16 +3741,16 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                         });
                         
                         // Create ticket - use direct button click handler
-const createTicketBtn = document.getElementById('createTicketBtn');
-if (createTicketBtn) {
-    console.log("Found create ticket button, attaching click handler");
-    createTicketBtn.addEventListener('click', e => {
-        console.log("Create ticket button clicked");
-        this.handleCreateTicket(e);
-    });
-} else {
-    console.error('Create ticket button not found');
-}
+                        const createTicketBtn = document.getElementById('createTicketBtn');
+                        if (createTicketBtn) {
+                            console.log("Found create ticket button, attaching click handler");
+                            createTicketBtn.addEventListener('click', e => {
+                                console.log("Create ticket button clicked");
+                                this.handleCreateTicket(e);
+                            });
+                        } else {
+                            console.error('Create ticket button not found');
+                        }
                         
                         // Refresh buttons
                         dom.refreshTickets.addEventListener('click', () => this.loadTickets());
@@ -2915,7 +3853,7 @@ if (createTicketBtn) {
                         this.loadTickets();
                         this.checkServerStatus();
                         
-						// Call updateFormFields on init to set initial state
+                        // Call updateFormFields on init to set initial state
                         updateFormFields();
 
                         // Load projects on init
@@ -2965,78 +3903,78 @@ if (createTicketBtn) {
                 }
 
                 function loadProjectTickets(projectKey) {
-    const projectTicketsContainer = document.getElementById('project-tickets');
-    projectTicketsContainer.innerHTML = "<h3>" + projectKey + " Tickets</h3><div>Loading tickets...</div>";
-    
-    // Fix: Remove fmt.Sprintf and use proper URL construction
-    fetch("/rest/api/2/search?jql=project=" + encodeURIComponent(projectKey))
-        .then(response => response.json())
-        .then(data => {
-            let html = [
-                "<h3>" + projectKey + " Tickets</h3>",
-                "<table>",
-                "    <thead>",
-                "        <tr>",
-                "            <th>Key</th>",
-                "            <th>Summary</th>",
-                "            <th>Status</th>",
-                "            <th>Created</th>",
-                "        </tr>",
-                "    </thead>",
-                "    <tbody>"
-            ].join("\n");
-            
-            if (data.issues && data.issues.length > 0) {
-                data.issues.forEach(issue => {
-                    html += [
-                        "<tr class='ticket-row' data-ticket-key='" + issue.key + "'>",
-                        "    <td>" + issue.key + "</td>",
-                        "    <td>" + issue.fields.summary + "</td>",
-                        "    <td>" + issue.fields.status.name + "</td>",
-                        "    <td>" + new Date(issue.fields.created).toLocaleDateString() + "</td>",
-                        "</tr>"
-                    ].join("\n");
-                });
-            } else {
-                html += [
-                    "<tr>",
-                    "    <td colspan='4'>No tickets found for this project</td>",
-                    "</tr>"
-                ].join("\n");
-            }
-            
-            html += [
-                "    </tbody>",
-                "</table>"
-            ].join("\n");
-            
-            projectTicketsContainer.innerHTML = html;
-            
-            // Add click event to ticket rows
-            document.querySelectorAll('.ticket-row').forEach(row => {
-                row.addEventListener('click', function() {
-                    const ticketKey = this.getAttribute('data-ticket-key');
+                    const projectTicketsContainer = document.getElementById('project-tickets');
+                    projectTicketsContainer.innerHTML = "<h3>" + projectKey + " Tickets</h3><div>Loading tickets...</div>";
                     
-                    // Switch to tickets tab and load the ticket details
-                    document.querySelector('.tab[data-tab="tickets"]').click();
-                    app.loadTicketDetails(ticketKey);
-                });
+                    fetch("/rest/api/2/search?jql=project=" + encodeURIComponent(projectKey))
+                        .then(response => response.json())
+                        .then(data => {
+                            let html = [
+                                "<h3>" + projectKey + " Tickets</h3>",
+                                "<table>",
+                                "    <thead>",
+                                "        <tr>",
+                                "            <th>Key</th>",
+                                "            <th>Summary</th>",
+                                "            <th>Status</th>",
+                                "            <th>Created</th>",
+                                "        </tr>",
+                                "    </thead>",
+                                "    <tbody>"
+                            ].join("\n");
+                            
+                            if (data.issues && data.issues.length > 0) {
+                                data.issues.forEach(issue => {
+                                    html += [
+                                        "<tr class='ticket-row' data-ticket-key='" + issue.key + "'>",
+                                        "    <td>" + issue.key + "</td>",
+                                        "    <td>" + issue.fields.summary + "</td>",
+                                        "    <td>" + issue.fields.status.name + "</td>",
+                                        "    <td>" + new Date(issue.fields.created).toLocaleDateString() + "</td>",
+                                        "</tr>"
+                                    ].join("\n");
+                                });
+                            } else {
+                                html += [
+                                    "<tr>",
+                                    "    <td colspan='4'>No tickets found for this project</td>",
+                                    "</tr>"
+                                ].join("\n");
+                            }
+                            
+                            html += [
+                                "    </tbody>",
+                                "</table>"
+                            ].join("\n");
+                            
+                            projectTicketsContainer.innerHTML = html;
+                            
+                            // Add click event to ticket rows
+                            document.querySelectorAll('.ticket-row').forEach(row => {
+                                row.addEventListener('click', function() {
+                                    const ticketKey = this.getAttribute('data-ticket-key');
+                                    
+                                    // Switch to tickets tab and load the ticket details
+                                    document.querySelector('.tab[data-tab="tickets"]').click();
+                                    app.loadTicketDetails(ticketKey);
+                                });
+                                
+                                // Add hover style
+                                row.style.cursor = 'pointer';
+                                row.addEventListener('mouseover', function() {
+                                    this.style.backgroundColor = '#f5f5f5';
+                                });
+                                row.addEventListener('mouseout', function() {
+                                    this.style.backgroundColor = '';
+                                });
+                            });
+                        })
+                        .catch(error => {
+                            console.error('Error loading project tickets:', error);
+                            projectTicketsContainer.innerHTML = "<h3>" + projectKey + " Tickets</h3><div>Error loading tickets</div>";
+                        });
+                }
                 
-                // Add hover style
-                row.style.cursor = 'pointer';
-                row.addEventListener('mouseover', function() {
-                    this.style.backgroundColor = '#f5f5f5';
-                });
-                row.addEventListener('mouseout', function() {
-                    this.style.backgroundColor = '';
-                });
-            });
-        })
-        .catch(error => {
-            console.error('Error loading project tickets:', error);
-            projectTicketsContainer.innerHTML = "<h3>" + projectKey + " Tickets</h3><div>Error loading tickets</div>";
-        });
-}
                 // Initialize the application
                 document.addEventListener('DOMContentLoaded', () => {
                     app.init();
