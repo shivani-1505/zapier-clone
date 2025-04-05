@@ -48,7 +48,7 @@ var MockDatabase = map[string]map[string]interface{}{
 	"regulatory_changes": {},
 }
 
-// Special handler for risk creation that also sends a webhook to Jira
+// Modify the handleCreateRisk function to ensure correct data flow:
 func handleCreateRisk(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -58,6 +58,8 @@ func handleCreateRisk(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
+
+	log.Printf("[SERVICENOW] Received risk creation request with data: %+v", riskData)
 
 	// Generate a risk ID and number if not provided
 	sysID, ok := riskData["sys_id"].(string)
@@ -75,21 +77,133 @@ func handleCreateRisk(w http.ResponseWriter, r *http.Request) {
 	riskData["created_on"] = time.Now().Format(time.RFC3339)
 	riskData["updated_on"] = time.Now().Format(time.RFC3339)
 
+	// Set status if not provided
+	if _, hasStatus := riskData["status"]; !hasStatus {
+		riskData["status"] = "New"
+	}
+
+	// Ensure severity field is properly set from the form submission
+	if severity, hasSeverity := riskData["severity"].(string); hasSeverity {
+		log.Printf("[SERVICENOW] Creating risk with severity: %s", severity)
+	} else {
+		// Default severity if not provided
+		riskData["severity"] = "Medium"
+		log.Printf("[SERVICENOW] No severity provided, defaulting to Medium")
+	}
+
 	// Make sure risks map exists
 	if MockDatabase["risks"] == nil {
 		MockDatabase["risks"] = make(map[string]interface{})
 	}
 
+	// Store risk in database
 	MockDatabase["risks"][sysID] = riskData
+	log.Printf("[SERVICENOW] Stored risk in database with sysID: %s and number: %s", sysID, riskNumber)
 
-	// Send a webhook to sync this with Jira
-	go triggerWebhook("sn_risk_risk", sysID, "insert", riskData)
+	// Create a deep copy of the risk data to avoid reference issues
+	riskDataCopy := make(map[string]interface{})
+	for k, v := range riskData {
+		riskDataCopy[k] = v
+	}
 
-	// Also send a notification directly to Slack
-	go sendSlackNotification(riskData)
+	// IMPORTANT: Log the data we'll be sending to external systems
+	if severity, ok := riskDataCopy["severity"].(string); ok {
+		log.Printf("[SERVICENOW] Risk %s will be sent with severity: %s", riskNumber, severity)
+	}
+
+	// Send a single webhook to Jira that will be responsible for also notifying Slack
+	// This ensures consistent data between all systems
+	log.Printf("[SERVICENOW] Sending risk webhook to Jira for %s", riskNumber)
+	go sendRiskWebhook(sysID, "insert", riskDataCopy)
 
 	// Return the created risk
 	json.NewEncoder(w).Encode(ResponseResult{Result: riskData})
+}
+
+// New function specifically for sending risk webhooks to Jira
+func sendRiskWebhook(sysID, actionType string, data map[string]interface{}) {
+	webhookEndpoint := "http://localhost:4000/api/webhooks/servicenow" // Jira webhook endpoint
+
+	// IMPORTANT: Log the severity value being sent to Jira
+	if severity, ok := data["severity"].(string); ok {
+		log.Printf("[SERVICENOW] Risk severity being sent to Jira: %s", severity)
+	} else {
+		log.Printf("[SERVICENOW] WARNING: No severity found in data being sent to Jira")
+	}
+
+	// Create webhook payload
+	webhookPayload := map[string]interface{}{
+		"sys_id":        sysID,
+		"table_name":    "sn_risk_risk",
+		"action_type":   actionType,
+		"data":          data,
+		"create_entity": true,
+	}
+
+	// Marshal to JSON
+	jsonPayload, err := json.Marshal(webhookPayload)
+	if err != nil {
+		log.Printf("[SERVICENOW] Error marshaling risk webhook payload: %v", err)
+		return
+	}
+
+	// Send the webhook to Jira
+	resp, err := http.Post(webhookEndpoint, "application/json", bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		log.Printf("[SERVICENOW] Error sending risk webhook to Jira: %v", err)
+		return
+	}
+
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		log.Printf("[SERVICENOW] Risk webhook sent successfully to Jira for sys_id: %s", sysID)
+
+		// After successful webhook to Jira, also send EXACT SAME data to Slack
+		// This ensures both systems get identical information including severity
+		go sendGenericSlackNotification("risk", data)
+	} else {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("[SERVICENOW] Risk webhook to Jira failed: %d, %s", resp.StatusCode, string(body))
+	}
+}
+
+func triggerWebhookNoNotification(tableName, sysID, actionType string, data map[string]interface{}) {
+	webhookEndpoint := "http://localhost:4000/api/webhooks/servicenow" // Jira webhook endpoint
+
+	// Create a deep copy of the data to avoid reference issues
+	dataCopy := make(map[string]interface{})
+	for k, v := range data {
+		dataCopy[k] = v
+	}
+
+	webhookPayload := map[string]interface{}{
+		"sys_id":        sysID,
+		"table_name":    tableName,
+		"action_type":   actionType,
+		"data":          dataCopy,
+		"create_entity": true,
+	}
+
+	jsonPayload, err := json.Marshal(webhookPayload)
+	if err != nil {
+		log.Printf("[SERVICENOW] Error marshaling webhook payload: %v", err)
+		return
+	}
+
+	// Send the webhook
+	resp, err := http.Post(webhookEndpoint, "application/json", bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		log.Printf("[SERVICENOW] Error sending webhook: %v", err)
+		return
+	}
+
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("[SERVICENOW] Webhook failed: status %d, response: %s", resp.StatusCode, string(body))
+	} else {
+		log.Printf("[SERVICENOW] Webhook sent successfully to %s", webhookEndpoint)
+	}
 }
 
 // Generic function to send Slack notifications for any GRC item
@@ -392,9 +506,10 @@ func main() {
 	// Keep the existing specific GET handlers while using generic handlers for POST
 	// Risk
 	r.HandleFunc("/api/now/table/sn_risk_risk", handleRisks).Methods("GET")
-	r.HandleFunc("/api/now/table/sn_risk_risk", handleGenericTable).Methods("POST", "PATCH")
+	r.HandleFunc("/api/now/table/sn_risk_risk", handleCreateRisk).Methods("POST") // Use special handler for POST
+	r.HandleFunc("/api/now/table/sn_risk_risk", handleGenericTable).Methods("PATCH")
 	r.HandleFunc("/api/now/table/sn_risk_risk/{id}", handleRiskByID).Methods("GET", "PATCH", "DELETE")
-
+	r.HandleFunc("/servicenow/create_risk", handleCreateRisk).Methods("POST")
 	// Compliance Tasks
 	r.HandleFunc("/api/now/table/sn_compliance_task", handleComplianceTasks).Methods("GET")
 	r.HandleFunc("/api/now/table/sn_compliance_task", handleGenericTable).Methods("POST", "PATCH")
@@ -997,6 +1112,42 @@ func handleComplianceTaskByID(w http.ResponseWriter, r *http.Request) {
 	handleGenericItemByID(w, r)
 }
 
+// Add this function to your code
+func triggerWebhookHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	vars := mux.Vars(r)
+	tableName := vars["table_name"]
+	actionType := vars["action_type"]
+
+	// Parse the request body to get the data
+	var data map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Generate a sys_id if not provided
+	sysID, ok := data["sys_id"].(string)
+	if !ok || sysID == "" {
+		sysID = fmt.Sprintf("%s_%d", tableName, time.Now().UnixNano())
+		data["sys_id"] = sysID
+	}
+
+	// Trigger the webhook
+	go triggerWebhook(tableName, sysID, actionType, data)
+
+	// Return success
+	log.Printf("[MOCK SERVICENOW] Webhook triggered for %s/%s with action %s", tableName, sysID, actionType)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":     "success",
+		"table_name": tableName,
+		"sys_id":     sysID,
+		"action":     actionType,
+	})
+}
+
 func handleIncidents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	incidents := []interface{}{}
@@ -1085,6 +1236,13 @@ func handleGenericTable(w http.ResponseWriter, r *http.Request) {
 	tableName := strings.TrimPrefix(r.URL.Path, "/api/now/table/")
 	if tableName == "" {
 		http.Error(w, "Invalid table name", http.StatusBadRequest)
+		return
+	}
+
+	// Skip risk creation in the generic handler - it should go through handleCreateRisk
+	if tableName == "sn_risk_risk" && r.Method == "POST" {
+		log.Printf("[MOCK SERVICENOW] Skipping risk creation in generic handler, should use handleCreateRisk instead")
+		http.Error(w, "Please use the specialized risk creation endpoint", http.StatusBadRequest)
 		return
 	}
 
@@ -1302,11 +1460,27 @@ func handleRisksByCategory(w http.ResponseWriter, r *http.Request) {
 
 // Webhook trigger helper function
 func triggerWebhook(tableName, sysID, actionType string, data map[string]interface{}) {
+	// For risks, we now only allow ServiceNow to create them, and we only send to Jira
+	if tableName == "sn_risk_risk" {
+		// Log instead of sending duplicate webhook for risks
+		log.Printf("[SERVICENOW] Skipping standard webhook for risk %s - using specialized flow", sysID)
+		return
+	}
+
+	// For all other tables, continue with normal webhook flow
+	webhookEndpoint := "http://localhost:8081/api/webhooks/servicenow"
+
+	// Create a deep copy of the data to avoid reference issues
+	dataCopy := make(map[string]interface{})
+	for k, v := range data {
+		dataCopy[k] = v
+	}
+
 	webhookPayload := map[string]interface{}{
 		"sys_id":      sysID,
 		"table_name":  tableName,
 		"action_type": actionType,
-		"data":        data,
+		"data":        dataCopy,
 	}
 
 	jsonPayload, err := json.Marshal(webhookPayload)
@@ -1315,104 +1489,21 @@ func triggerWebhook(tableName, sysID, actionType string, data map[string]interfa
 		return
 	}
 
-	// Send to Jira
-	resp, err := http.Post("http://localhost:4000/api/webhooks/servicenow", "application/json", bytes.NewBuffer(jsonPayload))
-	if err != nil {
-		log.Printf("Error sending webhook to Jira for %s/%s: %v", tableName, sysID, err)
-	} else {
-		defer resp.Body.Close()
-		if resp.StatusCode == http.StatusOK {
-			log.Printf("Webhook sent successfully to Jira for %s/%s", tableName, sysID)
-		} else {
-			body, _ := io.ReadAll(resp.Body)
-			log.Printf("Webhook to Jira failed for %s/%s: %d, %s", tableName, sysID, resp.StatusCode, string(body))
-		}
-	}
-
-	// Send to Slack integration server or other webhook receiver (if needed)
-	respSlack, err := http.Post("http://localhost:8081/api/webhooks/servicenow", "application/json", bytes.NewBuffer(jsonPayload))
-	if err != nil {
-		log.Printf("Error sending webhook to integration server for %s/%s: %v", tableName, sysID, err)
-	} else {
-		defer respSlack.Body.Close()
-		if respSlack.StatusCode == http.StatusOK {
-			log.Printf("Webhook sent successfully to integration server for %s/%s", tableName, sysID)
-		} else {
-			body, _ := io.ReadAll(respSlack.Body)
-			log.Printf("Webhook to integration server failed for %s/%s: %d, %s", tableName, sysID, respSlack.StatusCode, string(body))
-		}
-	}
-}
-
-// Webhook trigger endpoint
-func triggerWebhookHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	tableName := vars["table_name"]
-	actionType := vars["action_type"]
-
-	// Parse the data from the request
-	var data map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
-		log.Printf("Error decoding request body: %v", err)
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	// Map ServiceNow table names to internal mock table names
-	tableNameMap := map[string]string{
-		"sn_risk_risk":           "risks",
-		"sn_compliance_task":     "compliance_tasks",
-		"sn_si_incident":         "incidents",
-		"sn_policy_control_test": "control_tests",
-		"sn_audit_finding":       "audit_findings",
-		"sn_vendor_risk":         "vendor_risks",
-		"sn_regulatory_change":   "regulatory_changes",
-	}
-
-	// Check if the table is valid and get the internal table name
-	internalTable, validTable := tableNameMap[tableName]
-	if !validTable {
-		log.Printf("Invalid table name: %s", tableName)
-		http.Error(w, "Invalid table name", http.StatusBadRequest)
-		return
-	}
-
-	// Use provided sys_id if available, otherwise generate one
-	sysID, ok := data["sys_id"].(string)
-	if !ok || sysID == "" {
-		sysID = fmt.Sprintf("mock%d", time.Now().UnixNano())
-		data["sys_id"] = sysID
-	}
-
-	// Add timestamps if not provided
-	if _, ok := data["created_on"]; !ok {
-		data["created_on"] = time.Now().Format(time.RFC3339)
-	}
-	if _, ok := data["updated_on"]; !ok {
-		data["updated_on"] = time.Now().Format(time.RFC3339)
-	}
-
-	// Ensure the internal table map is initialized
-	if MockDatabase[internalTable] == nil {
-		MockDatabase[internalTable] = make(map[string]interface{})
-	}
-
-	// Store the data in the mock database
-	MockDatabase[internalTable][sysID] = data
-	log.Printf("Webhook trigger stored %s/%s: %v", tableName, sysID, data)
-
 	// Send the webhook
-	go triggerWebhook(tableName, sysID, actionType, data)
+	resp, err := http.Post(webhookEndpoint, "application/json", bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		log.Printf("Error sending webhook to %s for %s/%s: %v", webhookEndpoint, tableName, sysID, err)
+		return
+	}
 
-	// Return the status
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":      "success",
-		"message":     "Webhook sent to http://localhost:8081/api/webhooks/servicenow",
-		"webhook_id":  fmt.Sprintf("mock-webhook-%d", time.Now().UnixNano()),
-		"table_name":  tableName,
-		"action_type": actionType,
-	})
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		log.Printf("Webhook sent successfully to %s for %s/%s", webhookEndpoint, tableName, sysID)
+	} else {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("Webhook to %s failed for %s/%s: %d, %s",
+			webhookEndpoint, tableName, sysID, resp.StatusCode, string(body))
+	}
 }
 
 // Optional: Handle Jira webhook directly (if bypassing port 8080)
@@ -1692,7 +1783,7 @@ func processSlashCommand(command, text, userID string) map[string]interface{} {
 }
 
 // Improved updateServiceNowItem function to better handle different item types
-// updateServiceNowItem handles updating or creating items in the mock ServiceNow database
+// Improved updateServiceNowItem function to better handle different item types
 func updateServiceNowItem(table, itemID string, updates map[string]interface{}) bool {
 	log.Printf("[MOCK SERVICENOW] Attempting to update %s with ID %s with updates: %v", table, itemID, updates)
 
@@ -1703,10 +1794,13 @@ func updateServiceNowItem(table, itemID string, updates map[string]interface{}) 
 
 	// Normalize item ID based on table type
 	normalizedID := normalizeItemID(table, itemID)
+	log.Printf("[MOCK SERVICENOW] Normalized ID: %s (from %s)", normalizedID, itemID)
 
 	// Find existing item
-	var matchedItem map[string]interface{}
-	var matchedSysID string
+	var matchedItems []struct {
+		sysID string
+		item  map[string]interface{}
+	}
 
 	for sysID, item := range MockDatabase[table] {
 		itemMap, ok := item.(map[string]interface{})
@@ -1717,52 +1811,72 @@ func updateServiceNowItem(table, itemID string, updates map[string]interface{}) 
 		// Check for matching number or sys_id
 		if number, hasNumber := itemMap["number"].(string); hasNumber {
 			if strings.EqualFold(number, normalizedID) ||
-				strings.HasSuffix(number, strings.TrimPrefix(normalizedID, number[:3])) ||
+				strings.HasSuffix(number, strings.TrimPrefix(normalizedID, table[:3])) ||
 				number == normalizedID {
-				matchedItem = itemMap
-				matchedSysID = sysID
-				break
+				matchedItems = append(matchedItems, struct {
+					sysID string
+					item  map[string]interface{}
+				}{sysID, itemMap})
 			}
 		}
 
 		// Check for matching sys_id if no number match
 		if sysID == normalizedID {
-			matchedItem = itemMap
-			matchedSysID = sysID
-			break
+			matchedItems = append(matchedItems, struct {
+				sysID string
+				item  map[string]interface{}
+			}{sysID, itemMap})
 		}
 	}
 
+	// Log matches found
+	log.Printf("[MOCK SERVICENOW] Found %d matching items for %s", len(matchedItems), normalizedID)
+
 	// If no matching item found, create a new one
-	if matchedItem == nil {
+	if len(matchedItems) == 0 {
 		log.Printf("[MOCK SERVICENOW] Creating new item in %s with ID %s", table, normalizedID)
-		matchedSysID = fmt.Sprintf("%s_%d", table, time.Now().UnixNano())
-		matchedItem = map[string]interface{}{
-			"sys_id":     matchedSysID,
+		newSysID := fmt.Sprintf("%s_%d", table, time.Now().UnixNano())
+		newItem := map[string]interface{}{
+			"sys_id":     newSysID,
 			"number":     normalizedID,
 			"created_on": time.Now().Format(time.RFC3339),
 		}
-		MockDatabase[table][matchedSysID] = matchedItem
+		MockDatabase[table][newSysID] = newItem
+		matchedItems = append(matchedItems, struct {
+			sysID string
+			item  map[string]interface{}
+		}{newSysID, newItem})
 	}
 
-	// Update the item with provided updates
-	for k, v := range updates {
-		matchedItem[k] = v
+	// Update ALL matching items with provided updates
+	updated := false
+	for _, match := range matchedItems {
+		// Update the item with provided updates
+		for k, v := range updates {
+			match.item[k] = v
+		}
+
+		// Always update the updated_on timestamp
+		match.item["updated_on"] = time.Now().Format(time.RFC3339)
+
+		// Update the mock database
+		MockDatabase[table][match.sysID] = match.item
+		updated = true
+
+		log.Printf("[MOCK SERVICENOW] Updated %s item %s (sys_id: %s)", table, normalizedID, match.sysID)
 	}
 
-	// Always update the updated_on timestamp
-	matchedItem["updated_on"] = time.Now().Format(time.RFC3339)
+	if updated {
+		// Only send notification for the first matching item to avoid duplicate notifications
+		if len(matchedItems) > 0 {
+			go sendUpdateNotificationToSlack(table, matchedItems[0].item)
+		}
+		return true
+	}
 
-	// Update the mock database
-	MockDatabase[table][matchedSysID] = matchedItem
-
-	log.Printf("[MOCK SERVICENOW] Successfully updated %s item %s", table, normalizedID)
-
-	// Trigger notification to Slack
-	go sendUpdateNotificationToSlack(table, matchedItem)
-
-	return true
+	return false
 }
+
 func normalizeItemID(table, itemID string) string {
 	// Remove any prefix that might already exist
 	cleanedID := strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(
