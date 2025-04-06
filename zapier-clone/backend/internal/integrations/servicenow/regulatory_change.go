@@ -3,6 +3,7 @@ package servicenow
 
 import (
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -116,6 +117,32 @@ func (h *RegulatoryChangeHandler) HandleNewRegulatoryChange(change RegulatoryCha
 	}
 
 	return ts, nil
+}
+
+// HandleRegulatoryChangeUpdate processes updates from Jira for regulatory changes
+func (h *RegulatoryChangeHandler) HandleRegulatoryChangeUpdate(changeID, jiraKey, status, description string) error {
+	// Map Jira status to ServiceNow state
+	state := "in_progress"
+	if status == "Done" {
+		state = "implemented"
+	}
+
+	// Update the regulatory change in ServiceNow
+	body := map[string]string{
+		"state":                state,
+		"implementation_notes": fmt.Sprintf("Update from Jira: %s", description),
+	}
+
+	_, err := h.ServiceNowClient.makeRequest("PATCH",
+		fmt.Sprintf("api/now/table/sn_regulatory_change/%s", changeID), body)
+	if err != nil {
+		return fmt.Errorf("error updating regulatory change from Jira: %w", err)
+	}
+
+	log.Printf("Updated ServiceNow regulatory change %s from Jira %s (state: %s)",
+		changeID, jiraKey, state)
+
+	return nil
 }
 
 // HandleImpactAssessment processes an impact assessment for a regulatory change

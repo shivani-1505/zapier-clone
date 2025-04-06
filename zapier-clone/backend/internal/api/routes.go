@@ -11,6 +11,7 @@ import (
 	"github.com/shivani-1505/zapier-clone/backend/internal/integrations/jira"
 	"github.com/shivani-1505/zapier-clone/backend/internal/integrations/servicenow"
 	"github.com/shivani-1505/zapier-clone/backend/internal/integrations/slack"
+	"github.com/shivani-1505/zapier-clone/backend/internal/reporting"
 )
 
 // SetupRoutes configures all the API routes for the application
@@ -51,6 +52,19 @@ func SetupRoutes(r *mux.Router, serviceNowClient *servicenow.Client, slackClient
 
 	// Jira webhook endpoints
 	r.HandleFunc("/api/webhooks/jira", jiraWebhookHandler.HandleWebhook).Methods("POST")
+
+	// Dashboard endpoint
+	r.HandleFunc("/api/dashboard", func(w http.ResponseWriter, r *http.Request) {
+		data, err := reporting.GetDashboardData(jiraClient)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to fetch dashboard data: %v", err), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(data); err != nil {
+			http.Error(w, fmt.Sprintf("Error encoding response: %v", err), http.StatusInternalServerError)
+		}
+	}).Methods("GET")
 
 	// Health check endpoint
 	r.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

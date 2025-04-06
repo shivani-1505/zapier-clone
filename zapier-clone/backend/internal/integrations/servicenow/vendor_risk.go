@@ -4,9 +4,11 @@ package servicenow
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
+	"github.com/shivani-1505/zapier-clone/backend/internal/integrations/jira"
 	"github.com/shivani-1505/zapier-clone/backend/internal/integrations/slack"
 )
 
@@ -32,6 +34,7 @@ type VendorRisk struct {
 type VendorRiskHandler struct {
 	ServiceNowClient *Client
 	SlackClient      *slack.Client
+	JiraClient       *jira.Client // Add JiraClient for direct Jira interaction
 }
 
 // NewVendorRiskHandler creates a new vendor risk handler
@@ -121,6 +124,7 @@ func (h *VendorRiskHandler) HandleNewVendorRisk(risk VendorRisk) (string, error)
 }
 
 // HandleComplianceReportRequest processes a compliance report request
+// HandleComplianceReportRequest processes a compliance report request
 func (h *VendorRiskHandler) HandleComplianceReportRequest(riskID, channelID, threadTS, userID string) error {
 	// Get the vendor risk info to get the vendor name
 	resp, err := h.ServiceNowClient.makeRequest("GET", fmt.Sprintf("api/now/table/sn_vendor_risk/%s", riskID), nil)
@@ -158,6 +162,29 @@ func (h *VendorRiskHandler) HandleComplianceReportRequest(riskID, channelID, thr
 		return fmt.Errorf("error updating vendor risk in ServiceNow: %w", err)
 	}
 
+	// If we have a Jira client, update the corresponding Jira ticket
+	if h.JiraClient != nil {
+		// Find the Jira ticket associated with this vendor risk
+		jql := fmt.Sprintf("project=%s AND customfield_servicenow_id=\"%s\"", h.JiraClient.ProjectKey, riskID)
+		searchResult, err := h.JiraClient.SearchIssues(jql)
+		if err != nil {
+			log.Printf("Error searching for Jira ticket for vendor risk %s: %v", riskID, err)
+			return nil // Continue without Jira update
+		}
+
+		if len(searchResult.Issues) > 0 {
+			issueKey := searchResult.Issues[0].Key
+			commentText := fmt.Sprintf("Compliance report requested by %s on %s", userID, time.Now().Format(time.RFC3339))
+
+			// Add a comment to the Jira ticket
+			if err := h.JiraClient.AddComment(issueKey, commentText); err != nil {
+				log.Printf("Error adding comment to Jira ticket %s: %v", issueKey, err)
+			} else {
+				log.Printf("Added comment about compliance report request to Jira ticket %s", issueKey)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -183,6 +210,40 @@ func (h *VendorRiskHandler) HandleVendorStatusUpdate(riskID, channelID, threadTS
 	_, err = h.ServiceNowClient.makeRequest("PATCH", fmt.Sprintf("api/now/table/sn_vendor_risk/%s", riskID), body)
 	if err != nil {
 		return fmt.Errorf("error updating vendor status in ServiceNow: %w", err)
+	}
+
+	// If we have a Jira client, update the corresponding Jira ticket
+	if h.JiraClient != nil {
+		// Find the Jira ticket associated with this vendor risk
+		jql := fmt.Sprintf("project=%s AND customfield_servicenow_id=\"%s\"", h.JiraClient.ProjectKey, riskID)
+		searchResult, err := h.JiraClient.SearchIssues(jql)
+		if err != nil {
+			log.Printf("Error searching for Jira ticket for vendor risk %s: %v", riskID, err)
+			return nil // Continue without Jira update
+		}
+
+		if len(searchResult.Issues) > 0 {
+			issueKey := searchResult.Issues[0].Key
+
+			// Determine if we should mark the issue as Done
+			jiraStatus := "In Progress"
+			if strings.ToLower(status) == "received" || strings.ToLower(status) == "resolved" {
+				jiraStatus = "Done"
+			}
+
+			// Create update object
+			update := &jira.TicketUpdate{
+				Status:  jiraStatus,
+				Comment: fmt.Sprintf("Vendor status updated to %s: %s", status, notes),
+			}
+
+			// Update the Jira ticket
+			if err := h.JiraClient.UpdateIssue(issueKey, update); err != nil {
+				log.Printf("Error updating Jira ticket %s: %v", issueKey, err)
+			} else {
+				log.Printf("Updated Jira ticket %s with vendor status %s", issueKey, status)
+			}
+		}
 	}
 
 	return nil
@@ -213,4 +274,36 @@ func (h *VendorRiskHandler) ProcessVendorCommand(command *slack.Command) (string
 	default:
 		return "Unknown command", nil
 	}
+}
+
+// SetJiraClient sets the Jira client for this handler
+// This allows for adding the client after initialization
+func (h *VendorRiskHandler) SetJiraClient(jiraClient *jira.Client) {
+	h.JiraClient = jiraClient
+}
+
+// SyncFromJira synchronizes updates from Jira to ServiceNow
+func (h *VendorRiskHandler) SyncFromJira(riskID, jiraKey, jiraStatus, jiraComment string) error {
+	// Map Jira status to ServiceNow vendor risk state
+	vendorState := "In Progress"
+	if jiraStatus == "Done" {
+		vendorState = "Resolved"
+	}
+
+	// Update ServiceNow with data from Jira
+	body := map[string]string{
+		"state": vendorState,
+		"notes": fmt.Sprintf("Update from Jira: %s", jiraComment),
+	}
+
+	_, err := h.ServiceNowClient.makeRequest("PATCH",
+		fmt.Sprintf("api/now/table/sn_vendor_risk/%s", riskID), body)
+	if err != nil {
+		return fmt.Errorf("error updating vendor risk from Jira in ServiceNow: %w", err)
+	}
+
+	log.Printf("Updated ServiceNow vendor risk %s from Jira %s (state: %s)",
+		riskID, jiraKey, vendorState)
+
+	return nil
 }
