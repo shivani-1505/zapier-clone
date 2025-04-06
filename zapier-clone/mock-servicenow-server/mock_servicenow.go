@@ -111,10 +111,14 @@ func handleCreateRisk(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[SERVICENOW] Risk %s will be sent with severity: %s", riskNumber, severity)
 	}
 
-	// Send a single webhook to Jira that will be responsible for also notifying Slack
-	// This ensures consistent data between all systems
+	// MODIFIED: Send webhooks directly to both Jira and Slack
+	// 1. Send to Jira directly
 	log.Printf("[SERVICENOW] Sending risk webhook to Jira for %s", riskNumber)
-	go sendRiskWebhook(sysID, "insert", riskDataCopy)
+	go triggerWebhookNoNotification("sn_risk_risk", sysID, "insert", riskDataCopy)
+
+	// 2. Send to Slack directly
+	log.Printf("[SERVICENOW] Sending risk notification to Slack for %s", riskNumber)
+	go sendGenericSlackNotification("risk", riskDataCopy)
 
 	// Return the created risk
 	json.NewEncoder(w).Encode(ResponseResult{Result: riskData})
@@ -502,14 +506,15 @@ func main() {
 			MockDatabase[tableName] = make(map[string]interface{})
 		}
 	}
-	// Add routes for different ServiceNow tables
-	// Keep the existing specific GET handlers while using generic handlers for POST
-	// Risk
+
 	r.HandleFunc("/api/now/table/sn_risk_risk", handleRisks).Methods("GET")
-	r.HandleFunc("/api/now/table/sn_risk_risk", handleCreateRisk).Methods("POST") // Use special handler for POST
 	r.HandleFunc("/api/now/table/sn_risk_risk", handleGenericTable).Methods("PATCH")
 	r.HandleFunc("/api/now/table/sn_risk_risk/{id}", handleRiskByID).Methods("GET", "PATCH", "DELETE")
+
+	// FIXED: Removed duplicate route - this was causing the double processing
+	// Only register this route once
 	r.HandleFunc("/servicenow/create_risk", handleCreateRisk).Methods("POST")
+
 	// Compliance Tasks
 	r.HandleFunc("/api/now/table/sn_compliance_task", handleComplianceTasks).Methods("GET")
 	r.HandleFunc("/api/now/table/sn_compliance_task", handleGenericTable).Methods("POST", "PATCH")
@@ -539,9 +544,6 @@ func main() {
 	r.HandleFunc("/api/now/table/sn_regulatory_change", handleRegulatoryChanges).Methods("GET")
 	r.HandleFunc("/api/now/table/sn_regulatory_change", handleGenericTable).Methods("POST", "PATCH")
 	r.HandleFunc("/api/now/table/sn_regulatory_change/{id}", handleRegulatoryChangeByID).Methods("GET", "PATCH", "DELETE")
-
-	// Special risk creation handler
-	r.HandleFunc("/servicenow/create_risk", handleCreateRisk).Methods("POST")
 
 	// Other endpoints
 	r.HandleFunc("/api/now/table/sn_grc_summary", handleGRCSummary).Methods("GET")

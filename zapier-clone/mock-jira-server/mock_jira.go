@@ -2108,6 +2108,9 @@ func createJiraTicketFromServiceNow(payload ServiceNowWebhookPayload) {
 	} else {
 		log.Printf("[JIRA MOCK] Failed to create Jira ticket: %v", response)
 	}
+
+	// REMOVED: Don't call notifySlack here since ServiceNow already sent to Slack directly
+	// go notifySlack(ticket, "created")
 }
 func updateJiraTicketFromServiceNow(jiraKey string, payload ServiceNowWebhookPayload) {
 	data := payload.Data
