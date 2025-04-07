@@ -1,0 +1,27 @@
+FROM golang:1.20-alpine
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apk add --no-cache git gcc musl-dev
+
+# Copy the mock-slack-server directory
+COPY mock-slack-server ./mock-slack-server
+
+# Set working directory to mock-slack-server
+WORKDIR /app/mock-slack-server
+
+# Copy go.mod and go.sum
+COPY mock-slack-server/go.mod mock-slack-server/go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Build the mock-slack server
+RUN go build -v -o mock-slack ./mock_slack.go
+
+# Expose the mock-slack port
+EXPOSE 3002
+
+# Run the mock-slack server
+CMD ["./mock-slack"]

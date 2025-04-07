@@ -1,0 +1,27 @@
+FROM golang:1.20-alpine
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apk add --no-cache git gcc musl-dev
+
+# Copy the mock-servicenow-server directory
+COPY mock-servicenow-server ./mock-servicenow-server
+
+# Set working directory to mock-servicenow-server
+WORKDIR /app/mock-servicenow-server
+
+# Copy go.mod and go.sum
+COPY mock-servicenow-server/go.mod mock-servicenow-server/go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Build the mock-servicenow server
+RUN go build -v -o mock-servicenow ./mock_servicenow.go
+
+# Expose the mock-servicenow port
+EXPOSE 4000
+
+# Run the mock-servicenow server
+CMD ["./mock-servicenow"]

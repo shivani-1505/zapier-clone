@@ -28,8 +28,8 @@ type JiraTicket struct {
 	Resolution  string                 `json:"resolution,omitempty"`
 	Priority    string                 `json:"priority,omitempty"`
 	Assignee    string                 `json:"assignee,omitempty"`
-	Created     string                 `json:"created"`
-	Updated     string                 `json:"updated"`
+	Created     string                 `json:"created"` // Make sure this is always RFC3339 format
+	Updated     string                 `json:"updated"` // Make sure this is always RFC3339 format
 	DueDate     string                 `json:"dueDate,omitempty"`
 	Labels      []string               `json:"labels,omitempty"`
 	Components  []string               `json:"components,omitempty"`
@@ -294,6 +294,10 @@ func handleIssues(w http.ResponseWriter, r *http.Request) {
 			ticketType = "Task" // Default to Task if not specified
 		}
 
+		// Generate formatted timestamps
+		createdTime := time.Now()
+		createdTimeStr := createdTime.Format(time.RFC3339)
+
 		ticket := JiraTicket{
 			ID:          id,
 			Key:         key,
@@ -303,13 +307,20 @@ func handleIssues(w http.ResponseWriter, r *http.Request) {
 			Description: description,
 			Status:      "To Do",
 			Priority:    priority,
-			Created:     time.Now().Format(time.RFC3339),
-			Updated:     time.Now().Format(time.RFC3339),
+			Created:     createdTimeStr,
+			Updated:     createdTimeStr,
 			DueDate:     dueDate,
 			Assignee:    assignee,
 			Fields:      fields,
 			Comments:    []JiraComment{},
 		}
+
+		// Also set the timestamp in the fields for JavaScript
+		if ticket.Fields == nil {
+			ticket.Fields = make(map[string]interface{})
+		}
+		ticket.Fields["created"] = createdTimeStr
+		ticket.Fields["updated"] = createdTimeStr
 
 		if serviceNowID != "" {
 			MockDatabase.ServiceNowJiraMap[serviceNowID] = key
@@ -2088,6 +2099,10 @@ func createJiraTicketFromServiceNow(payload ServiceNowWebhookPayload) {
 		// This ensures the ticket shows up even if API call had issues
 		id := fmt.Sprintf("10%d", len(MockDatabase.Tickets)+1)
 
+		// Generate formatted timestamps
+		createdTime := time.Now()
+		createdTimeStr := createdTime.Format(time.RFC3339)
+
 		ticket := JiraTicket{
 			ID:          id,
 			Key:         key,
@@ -2096,11 +2111,18 @@ func createJiraTicketFromServiceNow(payload ServiceNowWebhookPayload) {
 			Description: description,
 			Status:      "To Do",
 			Priority:    fields["priority"].(map[string]string)["name"],
-			Created:     time.Now().Format(time.RFC3339),
-			Updated:     time.Now().Format(time.RFC3339),
+			Created:     createdTimeStr,
+			Updated:     createdTimeStr,
 			Fields:      fields,
 			Comments:    []JiraComment{},
 		}
+
+		// Also set the timestamp in the fields for JavaScript
+		if ticket.Fields == nil {
+			ticket.Fields = make(map[string]interface{})
+		}
+		ticket.Fields["created"] = createdTimeStr
+		ticket.Fields["updated"] = createdTimeStr
 
 		// Add the ticket directly to the database
 		MockDatabase.Tickets[key] = ticket
@@ -3254,8 +3276,18 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                         }, 5000);
                     },
                     formatDate: function(dateString) {
-                        return !dateString ? '' : new Date(dateString).toLocaleString();
-                    },
+        if (!dateString) return '';
+        try {
+            const date = new Date(dateString);
+            if (isNaN(date.getTime())) {
+                return dateString || 'Invalid Date'; // Return the original string if parse fails
+            }
+            return date.toLocaleString();
+        } catch (e) {
+            console.error("Error formatting date:", e, dateString);
+            return dateString || 'Invalid Date';
+        }
+    },
                     logWebhookEvent: function(message) {
                         const entry = document.createElement('div');
                         entry.className = 'log-entry';
@@ -3392,41 +3424,43 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
 
                 // Core functionality
                 const app = {
-                    async loadTickets() {
-                        try {
-                            const tickets = await api.fetch('/rest/api/2/issue');
-                            dom.ticketList.innerHTML = '';
-                            
-                            // Update the dashboard stats
-                            utils.updateDashboardStats(tickets);
-                            
-                            if (!tickets || tickets.length === 0) {
-                                dom.ticketList.innerHTML = '<li>No tickets found</li>';
-                                return;
-                            }
-                            
-                            tickets.forEach(ticket => {
-                                const statusClass = "status-" + ticket.status.toLowerCase().replace(/ /g, "-");
-                                
-                                const html = 
-                                    '<div class="ticket-header">' +
-                                    '<span class="ticket-key">' + ticket.key + '</span>' +
-                                    '<span class="ticket-status ' + statusClass + '">' + ticket.status + '</span>' +
-                                    '</div>' +
-                                    '<div>' + ticket.summary + '</div>';
-                                
-                                const li = document.createElement("li");
-                                li.className = "ticket-item";
-                                li.innerHTML = html;
-                                
-                                li.addEventListener("click", () => this.loadTicketDetails(ticket.key));
-                                dom.ticketList.appendChild(li);
-                            });
-                        } catch (error) {
-                            const errorMessage = "Failed to load tickets: " + error.message;
-                            utils.showAlert(errorMessage, "error");
-                        }
-                    },
+                    
+async loadTickets() {
+    try {
+        const tickets = await api.fetch('/rest/api/2/issue');
+        dom.ticketList.innerHTML = '';
+        
+        // Update the dashboard stats
+        utils.updateDashboardStats(tickets);
+        
+        if (!tickets || tickets.length === 0) {
+            dom.ticketList.innerHTML = '<li>No tickets found</li>';
+            return;
+        }
+        
+        tickets.forEach(ticket => {
+            const statusClass = "status-" + ticket.status.toLowerCase().replace(/ /g, "-");
+            
+            const html = 
+                '<div class="ticket-header">' +
+                '<span class="ticket-key">' + ticket.key + '</span>' +
+                '<span class="ticket-status ' + statusClass + '">' + ticket.status + '</span>' +
+                '</div>' +
+                '<div>' + ticket.summary + '</div>';
+            
+            const li = document.createElement("li");
+            li.className = "ticket-item";
+            li.innerHTML = html;
+            
+            li.addEventListener("click", () => this.loadTicketDetails(ticket.key));
+            dom.ticketList.appendChild(li);
+        });
+    } catch (error) {
+        const errorMessage = "Failed to load tickets: " + error.message;
+        utils.showAlert(errorMessage, "error");
+    }
+},
+
                     
                     async loadTicketDetails(key) {
                         try {
@@ -3905,78 +3939,96 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
                         });
                 }
 
-                function loadProjectTickets(projectKey) {
-                    const projectTicketsContainer = document.getElementById('project-tickets');
-                    projectTicketsContainer.innerHTML = "<h3>" + projectKey + " Tickets</h3><div>Loading tickets...</div>";
-                    
-                    fetch("/rest/api/2/search?jql=project=" + encodeURIComponent(projectKey))
-                        .then(response => response.json())
-                        .then(data => {
-                            let html = [
-                                "<h3>" + projectKey + " Tickets</h3>",
-                                "<table>",
-                                "    <thead>",
-                                "        <tr>",
-                                "            <th>Key</th>",
-                                "            <th>Summary</th>",
-                                "            <th>Status</th>",
-                                "            <th>Created</th>",
-                                "        </tr>",
-                                "    </thead>",
-                                "    <tbody>"
-                            ].join("\n");
-                            
-                            if (data.issues && data.issues.length > 0) {
-                                data.issues.forEach(issue => {
-                                    html += [
-                                        "<tr class='ticket-row' data-ticket-key='" + issue.key + "'>",
-                                        "    <td>" + issue.key + "</td>",
-                                        "    <td>" + issue.fields.summary + "</td>",
-                                        "    <td>" + issue.fields.status.name + "</td>",
-                                        "    <td>" + new Date(issue.fields.created).toLocaleDateString() + "</td>",
-                                        "</tr>"
-                                    ].join("\n");
-                                });
+                
+function loadProjectTickets(projectKey) {
+    const projectTicketsContainer = document.getElementById('project-tickets');
+    projectTicketsContainer.innerHTML = "<h3>" + projectKey + " Tickets</h3><div>Loading tickets...</div>";
+    
+    fetch("/rest/api/2/search?jql=project=" + encodeURIComponent(projectKey))
+        .then(response => response.json())
+        .then(data => {
+            let html = [
+                "<h3>" + projectKey + " Tickets</h3>",
+                "<table>",
+                "    <thead>",
+                "        <tr>",
+                "            <th>Key</th>",
+                "            <th>Summary</th>",
+                "            <th>Status</th>",
+                "            <th>Created</th>",
+                "        </tr>",
+                "    </thead>",
+                "    <tbody>"
+            ].join("\n");
+            
+            if (data.issues && data.issues.length > 0) {
+                data.issues.forEach(issue => {
+                    // Fix the date formatting here - handle invalid dates gracefully
+                    let createdDate = "No date";
+                    if (issue.fields && issue.fields.created) {
+                        try {
+                            const date = new Date(issue.fields.created);
+                            if (!isNaN(date.getTime())) {
+                                createdDate = date.toLocaleString();
                             } else {
-                                html += [
-                                    "<tr>",
-                                    "    <td colspan='4'>No tickets found for this project</td>",
-                                    "</tr>"
-                                ].join("\n");
+                                createdDate = issue.fields.created || "Invalid Date";
                             }
-                            
-                            html += [
-                                "    </tbody>",
-                                "</table>"
-                            ].join("\n");
-                            
-                            projectTicketsContainer.innerHTML = html;
-                            
-                            // Add click event to ticket rows
-                            document.querySelectorAll('.ticket-row').forEach(row => {
-                                row.addEventListener('click', function() {
-                                    const ticketKey = this.getAttribute('data-ticket-key');
-                                    
-                                    // Switch to tickets tab and load the ticket details
-                                    document.querySelector('.tab[data-tab="tickets"]').click();
-                                    app.loadTicketDetails(ticketKey);
-                                });
-                                
-                                // Add hover style
-                                row.style.cursor = 'pointer';
-                                row.addEventListener('mouseover', function() {
-                                    this.style.backgroundColor = '#f5f5f5';
-                                });
-                                row.addEventListener('mouseout', function() {
-                                    this.style.backgroundColor = '';
-                                });
-                            });
-                        })
-                        .catch(error => {
-                            console.error('Error loading project tickets:', error);
-                            projectTicketsContainer.innerHTML = "<h3>" + projectKey + " Tickets</h3><div>Error loading tickets</div>";
-                        });
-                }
+                        } catch (e) {
+                            console.error("Error parsing date:", e);
+                            createdDate = "Date error";
+                        }
+                    }
+
+                    html += [
+                        "<tr class='ticket-row' data-ticket-key='" + issue.key + "'>",
+                        "    <td>" + issue.key + "</td>",
+                        "    <td>" + issue.fields.summary + "</td>",
+                        "    <td>" + issue.fields.status.name + "</td>",
+                        "    <td>" + createdDate + "</td>",
+                        "</tr>"
+                    ].join("\n");
+                });
+            } else {
+                html += [
+                    "<tr>",
+                    "    <td colspan='4'>No tickets found for this project</td>",
+                    "</tr>"
+                ].join("\n");
+            }
+            
+            html += [
+                "    </tbody>",
+                "</table>"
+            ].join("\n");
+            
+            projectTicketsContainer.innerHTML = html;
+            
+            // Add click event to ticket rows
+            document.querySelectorAll('.ticket-row').forEach(row => {
+                row.addEventListener('click', function() {
+                    const ticketKey = this.getAttribute('data-ticket-key');
+                    
+                    // Switch to tickets tab and load the ticket details
+                    document.querySelector('.tab[data-tab="tickets"]').click();
+                    app.loadTicketDetails(ticketKey);
+                });
+                
+                // Add hover style
+                row.style.cursor = 'pointer';
+                row.addEventListener('mouseover', function() {
+                    this.style.backgroundColor = '#f5f5f5';
+                });
+                row.addEventListener('mouseout', function() {
+                    this.style.backgroundColor = '';
+                });
+            });
+        })
+        .catch(error => {
+            console.error('Error loading project tickets:', error);
+            projectTicketsContainer.innerHTML = "<h3>" + projectKey + " Tickets</h3><div>Error loading tickets</div>";
+        });
+}
+
                 
                 // Initialize the application
                 document.addEventListener('DOMContentLoaded', () => {

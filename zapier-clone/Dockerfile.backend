@@ -1,0 +1,27 @@
+FROM golang:1.20-alpine
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apk add --no-cache git gcc musl-dev
+
+# Copy the backend directory
+COPY backend ./backend
+
+# Set working directory to backend
+WORKDIR /app/backend
+
+# Copy go.mod and go.sum
+COPY backend/go.mod backend/go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Build the backend server
+RUN go build -v -o backend-server ./cmd/server/main.go
+
+# Expose the backend port
+EXPOSE 8081
+
+# Run the backend server
+CMD ["./backend-server"]
