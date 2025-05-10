@@ -1,0 +1,27 @@
+FROM golang:1.20-alpine
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apk add --no-cache git gcc musl-dev
+
+# Copy the mock-jira-server directory
+COPY mock-jira-server ./mock-jira-server
+
+# Set working directory to mock-jira-server
+WORKDIR /app/mock-jira-server
+
+# Copy go.mod and go.sum
+COPY mock-jira-server/go.mod mock-jira-server/go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Build the mock-jira server
+RUN go build -v -o mock-jira ./mock_jira.go
+
+# Expose the mock-jira port
+EXPOSE 3000
+
+# Run the mock-jira server
+CMD ["./mock-jira"]

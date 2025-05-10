@@ -1,3 +1,4 @@
+// backend/internal/integrations/jira/client.go
 package jira
 
 import (
@@ -120,6 +121,11 @@ func (c *Client) CreateIssue(ticket *Ticket) (*Ticket, error) {
 		for key, value := range ticket.Fields {
 			fields[key] = value
 		}
+	}
+
+	// If parent field is set (for subtasks)
+	if ticket.Parent != "" {
+		fields["parent"] = map[string]string{"key": ticket.Parent}
 	}
 
 	requestBody := map[string]interface{}{
@@ -353,4 +359,24 @@ func (c *Client) TransitionIssue(issueKey string, transitionID string) error {
 	}
 
 	return nil
+}
+
+// SearchResult represents the result of a Jira issue search
+
+// SearchIssues searches for issues using JQL
+func (c *Client) SearchIssues(jql string) (*SearchResult, error) {
+	// URL encode the JQL query
+	queryParams := fmt.Sprintf("jql=%s", jql)
+
+	resp, err := c.makeRequest("GET", fmt.Sprintf("search?%s", queryParams), nil)
+	if err != nil {
+		return nil, fmt.Errorf("error searching Jira issues: %w", err)
+	}
+
+	var result SearchResult
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("error unmarshaling search response: %w", err)
+	}
+
+	return &result, nil
 }

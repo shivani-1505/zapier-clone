@@ -1,3 +1,5 @@
+// backend/internal/integrations/jira/models.go
+
 package jira
 
 import (
@@ -288,6 +290,9 @@ type WebhookIssueFields struct {
 	Summary     string             `json:"summary"`
 	Description string             `json:"description"`
 	Status      *WebhookStatus     `json:"status"`
+	DueDate     string             `json:"duedate"`
+	Labels      []string           `json:"labels"`
+	Components  []WebhookComponent `json:"components"`
 	Resolution  *WebhookResolution `json:"resolution"`
 	Assignee    *WebhookUser       `json:"assignee"`
 	Reporter    *WebhookUser       `json:"reporter"`
@@ -295,6 +300,12 @@ type WebhookIssueFields struct {
 	IssueType   *WebhookIssueType  `json:"issuetype"`
 	// Add any custom fields you access
 	CustomFields map[string]interface{} `json:"-"`
+}
+
+type WebhookComponent struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Self string `json:"self"`
 }
 
 // UnmarshalJSON is a custom unmarshaller for WebhookIssueFields

@@ -2,6 +2,7 @@
 package servicenow
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -135,7 +136,7 @@ func (h *PolicyControlHandler) HandleTestResultSubmission(testID, channelID, thr
 	// Update ServiceNow with the test result
 	body := map[string]string{
 		"test_status": status,
-		"notes":       notes,
+		"results":     notes,
 		"updated_by":  userID,
 	}
 
@@ -176,4 +177,59 @@ func (h *PolicyControlHandler) ProcessControlCommand(command *slack.Command) (st
 	default:
 		return "Unknown command", nil
 	}
+}
+
+// GetControlTest gets a control test by ID
+func (h *PolicyControlHandler) GetControlTest(testID string) (*ControlTest, error) {
+	resp, err := h.ServiceNowClient.makeRequest("GET", fmt.Sprintf("api/now/table/sn_policy_control_test/%s", testID), nil)
+	if err != nil {
+		return nil, fmt.Errorf("error getting control test from ServiceNow: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var response struct {
+		Result ControlTest `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return nil, fmt.Errorf("error parsing ServiceNow response: %w", err)
+	}
+
+	return &response.Result, nil
+}
+
+// HandlePolicyControlSync synchronizes control test data between systems
+func (h *PolicyControlHandler) HandlePolicyControlSync(test ControlTest, jiraKey, slackChannel, slackTS string) error {
+	// Update the control test in ServiceNow if it has changed
+	body := map[string]string{
+		"test_status": test.Status,
+		"results":     test.Results,
+		"notes":       test.Notes,
+	}
+
+	_, err := h.ServiceNowClient.makeRequest("PATCH",
+		fmt.Sprintf("api/now/table/sn_policy_control_test/%s", test.ID), body)
+	if err != nil {
+		return fmt.Errorf("error updating control test in ServiceNow: %w", err)
+	}
+
+	// If we have Slack thread info, post an update
+	if slackChannel != "" && slackTS != "" {
+		statusEmoji := "⚠️"
+		if strings.ToLower(test.Status) == "pass" {
+			statusEmoji = "✅"
+		} else if strings.ToLower(test.Status) == "fail" {
+			statusEmoji = "❌"
+		}
+
+		message := slack.Message{
+			Text: fmt.Sprintf("%s Control test status updated to *%s*\n%s",
+				statusEmoji, test.Status, test.Results),
+		}
+
+		if _, err := h.SlackClient.PostReply(slackChannel, slackTS, message); err != nil {
+			return fmt.Errorf("error posting update to Slack: %w", err)
+		}
+	}
+
+	return nil
 }
